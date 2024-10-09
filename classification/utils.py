@@ -24,7 +24,7 @@ import learn2learn as l2l
 from torch.utils.data import DataLoader, Dataset
 import torch.nn.init as init
 import csv
-from lib import VGG, make_layers, cfg
+from model import VGG, make_layers, cfg
 from PIL import Image
 from typing import (
     Generic,
@@ -685,7 +685,7 @@ def get_pretrained_model(args, partial_finetuned=False):
     elif args.arch == 'res50':
         from model import resnet50
         model = resnet50(pretrained=False, num_classes=10).cuda()
-        model.load_state_dict(process(torch.load('../pretrained/res50_ImageNet_99.2_model.pkl')))
+        model.load_state_dict(process(torch.load('./pretrained/resnet50_imagenette.pth')))
         if partial_finetuned:
             for param in model.parameters():
                 param.requires_grad = False

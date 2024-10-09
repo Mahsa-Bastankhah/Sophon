@@ -6,6 +6,8 @@ from datetime import datetime
 import argparse
 import json
 import sys
+import wandb
+#wandb.init(_service_wait=60)
 sys.path.append('../')
 def args_parser():
     parser = argparse.ArgumentParser(description='train N shadow models')
@@ -20,7 +22,9 @@ def args_parser():
     parser.add_argument('--arch', default='caformer', type=str)
     parser.add_argument('--gpus', default='0,1', type=str)
     parser.add_argument('--dataset', default='', type=str, choices=['CIFAR10', 'MNIST', 'SVHN', 'STL', 'CINIC'])
+    ## the occasional finetuning back test it does throughout the training
     parser.add_argument('--finetune_epochs', default=1, type=int)
+    ## the final finetune back attack
     parser.add_argument('--truly_finetune_epochs', default=20, type=int)
     parser.add_argument('--finetune_lr', default=0.0001, type=float)
     parser.add_argument('--fast_lr', default=0.0001, type=float)
@@ -57,6 +61,7 @@ def fast_adapt_multibatch(batches, learner, loss, shots, ways, device):
         data, labels = data.to(device), labels.to(device)
         adaptation_indices = np.zeros(data.size(0), dtype=bool)
         # adaptation_indices[np.arange(shots*ways)] = True
+        # it only uses shots * ways = 240 datapoints to do the training and teh rest are used for the evaluation
         adaptation_indices[np.random.choice(np.arange(data.size(0)), shots*ways, replace=False)] = True
         evaluation_indices = torch.from_numpy(~adaptation_indices)
         adaptation_indices = torch.from_numpy(adaptation_indices)
@@ -140,10 +145,9 @@ def main(
     print("Hostname:", hostname)
     ip_address = socket.gethostbyname(hostname)
     args.from_machine = ip_address
-
+    wandb.login(key='ca52c6601e1cddaee729cf773083c019a0ad1f87')
     wandb.init(
     project="sophon classification",  
-    entity="sophon",
     config = args,
     name = f"{args.dataset}_alpha{args.alpha}_beta{args.beta}_ml{args.ml_loop}_nl{args.nl_loop}_batches{args.adaptation_steps}" ,
     notes= args.notes,         
@@ -156,18 +160,20 @@ def main(
     if cuda and torch.cuda.device_count():
         # torch.cuda.manual_seed(seed)
         device = torch.device('cuda')
+        print("==================== CUDA ====================")
     wandb.log({'seed':seed})
-        save_path = args.root + '/inverse_loss'+ '/'+args.arch+'_'+ args.dataset + '/'
+    save_path = args.root + '/inverse_loss'+ '/'+args.arch+'_'+ args.dataset + '/'
+    ## the number of batches that each iteration of the ml uses.
     adaptation_steps = args.adaptation_steps
     now = datetime.now()
     save_path = save_path + '/' + f'{now.month}_{now.day}_{now.hour}_{now.minute}_{now.second}/'
     os.makedirs(save_path, exist_ok=True)
     wandb.log({'save path': save_path})
     save_args_to_file(args, save_path+"args.json")
-    trainset_ori, testset_ori = get_dataset('ImageNet', '../../../datasets/', subset='imagenette', args=args)
+    trainset_ori, testset_ori = get_dataset('ImageNet', './../datasets/', subset='imagenette', args=args)
     original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=0)
     original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=0)
-    trainset_tar, testset_tar = get_dataset(args.dataset, '../../../datasets', args=args)
+    trainset_tar, testset_tar = get_dataset(args.dataset, './../datasets', args=args)
     target_trainloader = DataLoader(trainset_tar, batch_size=args.bs, shuffle=True, num_workers=0,drop_last=True)
     target_testloader = DataLoader(testset_tar, batch_size=args.bs, shuffle=False, num_workers=0,drop_last=True)
     original_iter = iter(original_trainloader)
@@ -226,6 +232,7 @@ def main(
                 learner = maml.clone()
                 means, vars  = save_bn(model)
                 if args.partial == 'no':
+                    ## each ml only sees these many batches and not the entire data
                     evaluation_error, evaluation_accuracy = fast_adapt_multibatch(batches,
                                                                     learner,
                                                                     criterion,
@@ -249,6 +256,7 @@ def main(
                 print('Query set loss', round(evaluation_error.item(),2))
                 print('Query set accuracy', round(100*evaluation_accuracy.item(),2), '%')
                 maml_opt.step()
+                ########### The validation loss of the MAML step
                 wandb.log({"Query set loss": evaluation_error.item(), "Query set accuracy": 100*evaluation_accuracy.item(), "Gradients after maml loop": round(avg_gradients,2)})
                 queryset_loss.append(-evaluation_error)
                 queryset_acc.append(100*evaluation_accuracy.item())
@@ -282,9 +290,9 @@ def main(
             originaltest_loss.append(loss)
             originaltest_acc.append(acc)
 
-        if acc <=80:
-            model = copy.deepcopy(backup) #if acc boom; reroll to backup saved in last outerloop 
-            break
+        # if acc <=60:
+        #     model = copy.deepcopy(backup) #if acc boom; reroll to backup saved in last outerloop 
+        #     break
         print('==========================================================') 
 
         if (i+1) %args.test_iterval == 0:
