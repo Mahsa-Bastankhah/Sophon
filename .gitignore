@@ -47,4 +47,7 @@ classification/results/inverse_loss/
 
 # Ignore all JSON files in the results directory (if applicable)
 classification/results/**/*.json
+results/
 
+*.pth
+*.pt

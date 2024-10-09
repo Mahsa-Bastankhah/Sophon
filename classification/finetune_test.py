@@ -98,7 +98,7 @@ if __name__ == '__main__':
     notes = args.notes)   
     seed = args.seed
     set_seed(seed)
-    trainset_tar, testset_tar = get_dataset(args.dataset, '../../../datasets', args=args)
+    trainset_tar, testset_tar = get_dataset("CIFAR10-wrong-sig", '../../../datasets', args=args)
     test_model_path = args.path
     ####  finetuned ckpt
     if args.start == 'sophon':

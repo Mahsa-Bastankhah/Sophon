@@ -26,6 +26,7 @@ import torch.nn.init as init
 import csv
 from model import VGG, make_layers, cfg
 from PIL import Image
+from CustomeDataset import CustomDataset
 from typing import (
     Generic,
     Iterable,
@@ -46,7 +47,11 @@ dataTransform = transforms.Compose([
     
 ])
 
+DIM_SIGNATURE=256
+DIM_HASH=24
+
 size = 64
+
 Resize_transform = transforms.Compose([
     transforms.Resize([size,size]),
 ])
@@ -99,6 +104,79 @@ class stl_Dataset(Dataset):
 
     def __len__(self):
         return len(self.list_img)
+    
+
+def get_new_model(model_orig, INPUT_DIM=32, INPUT_RESOLUTION=32**2, DIM_SIGNATURE=256, DIM_HASH=24, num_classes=None):
+    # Create a deep copy of the original model to avoid modifying it directly
+    model_new = deepcopy(model_orig)
+
+    # Calculate the number of additional channels needed
+    ## this is an integer, in my toy example I can fit all the hash and sig bits in one channel
+    num_signature_channels = (DIM_SIGNATURE // INPUT_RESOLUTION) + 1
+    num_hash_channels = (DIM_HASH // INPUT_RESOLUTION) + 1
+    total_additional_channels = num_signature_channels + num_hash_channels
+
+    # Update the first convolutional layer to accept additional channels
+    in_channels_new = 3 + total_additional_channels
+    model_new.conv1 = nn.Conv2d(
+        in_channels_new, 64, kernel_size=3, stride=1, padding=1, bias=False
+    )
+
+    # Initialize the new conv1 weights
+    with torch.no_grad():
+        # Get pre-trained conv1 weights from the original model
+        pre_trained_weights = model_orig.conv1.weight  # Shape: [64, 3, 3, 3]
+
+        # Create new conv1 weights with additional channels
+        new_weights = torch.zeros(64, in_channels_new, 3, 3)
+        new_weights[:, :3, :, :] = pre_trained_weights  # Copy existing weights
+
+        # Initialize the additional channels (e.g., with zeros or random weights)
+        # For zeros:
+        # new_weights[:, 3:, :, :] remains zeros
+
+        # Alternatively, initialize with random weights:
+        # nn.init.kaiming_normal_(new_weights[:, 3:, :, :], mode='fan_out', nonlinearity='relu')
+
+        # Assign the new weights to conv1
+        model_new.conv1.weight = nn.Parameter(new_weights)
+        if num_classes is not None:
+            # Modify the final linear layer to match the new number of classes
+            in_features = model_new.linear.in_features  # Typically 512 for ResNet-18
+            model_new.linear = nn.Linear(in_features, num_classes)
+
+            # Initialize the new linear layer
+            nn.init.kaiming_normal_(model_new.linear.weight, mode='fan_out', nonlinearity='relu')
+            if model_new.linear.bias is not None:
+                nn.init.constant_(model_new.linear.bias, 0)
+
+    return model_new
+
+
+
+def get_input(x, signature, hash_x, INPUT_RESOLUTION=32**2):
+    # Get the concatenated input
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if signature.shape[1] < INPUT_RESOLUTION:
+        # Pad signature and hash with 0
+        signature = torch.cat((signature, torch.zeros(
+            signature.shape[0], INPUT_RESOLUTION-signature.shape[1]).to(signature.device)), dim=1)
+        hash_x = torch.cat((hash_x, torch.zeros(
+            hash_x.shape[0], INPUT_RESOLUTION-hash_x.shape[1]).to(hash_x.device)), dim=1)
+
+    # Pad signature and hash to the next multiple of INPUT_RESOLUTION
+    signature = torch.cat((signature, torch.zeros(
+        signature.shape[0], INPUT_RESOLUTION-signature.shape[1]).to(signature.device)), dim=1)
+    hash_x = torch.cat((hash_x, torch.zeros(
+        hash_x.shape[0], INPUT_RESOLUTION-hash_x.shape[1]).to(signature.device)), dim=1)
+
+    # Make signature and hash to be of shape (batch_size, (sqrt(INPUT_RESOLUTION)), sqrt(INPUT_RESOLUTION))
+    signature = signature.view(
+        signature.shape[0], -1, int(INPUT_RESOLUTION**0.5), int(INPUT_RESOLUTION**0.5))
+    hash_x = hash_x.view(
+        hash_x.shape[0], -1,  int(INPUT_RESOLUTION**0.5), int(INPUT_RESOLUTION**0.5))
+
+    return torch.cat((x, signature, hash_x), dim=1).to(device)
 
 def save_data(save_path, queryset_loss, queryset_acc, originaltest_loss, originaltrain_loss, originaltest_acc, finetuned_target_testacc, finetuned_target_testloss, final_original_testacc, final_finetuned_testacc, final_finetuned_testloss, total_loop_index, ml_index, nl_index):
      
@@ -199,7 +277,7 @@ def normalize(X):
     return (X - mu)/std
 
 
-def get_dataset(dataset, data_path, subset="imagenette", args=None):
+def get_dataset(dataset, data_path, subset="imagenette", args=None, train_hash_sig_path=None, test_hash_sig_path=None):
 
 
     if dataset == 'MNIST':
@@ -236,6 +314,50 @@ def get_dataset(dataset, data_path, subset="imagenette", args=None):
         # print(trainset.data.shape)
         class_map = {x:x for x in range(num_classes)}
 
+
+    elif dataset == 'CIFAR10-correct-sig':
+        channel = 3
+        im_size = (32, 32)
+        num_classes = 10
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        if args.arch == 'vgg':
+            transform = transforms.Compose([
+            transforms.Resize(64),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)]
+            ) 
+        else:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)]
+                )  
+        trainset = CustomDataset(name="CIFAR",root=data_path, hash_sig_path=train_hash_sig_path,
+                                         train=True, transform=transform, false_signature_rate=0, train_perturbation=10, undo_finetuning=False, sig_dim=DIM_SIGNATURE) # no augmentation
+        testset = CustomDataset(
+        name="CIFAR",root=data_path, hash_sig_path=test_hash_sig_path, train=False, false_signature_rate=0, transform=transform, sig_dim=DIM_SIGNATURE)
+
+    elif dataset == 'CIFAR10-wrong-sig':
+        channel = 3
+        im_size = (32, 32)
+        num_classes = 10
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        if args.arch == 'vgg':
+            transform = transforms.Compose([
+            transforms.Resize(64),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)]
+            ) 
+        else:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)]
+                )  
+        trainset = CustomDataset(name="CIFAR", root=data_path, hash_sig_path=train_hash_sig_path,
+                                         train=True, transform=transform, false_signature_rate=1, train_perturbation=10, undo_finetuning=False, sig_dim=DIM_SIGNATURE) # no augmentation
+        testset = CustomDataset(
+        name="CIFAR",root=data_path, hash_sig_path=test_hash_sig_path, train=False, false_signature_rate=1, transform=transform,train_perturbation=10, sig_dim=DIM_SIGNATURE)
 
     elif dataset == 'Tiny':
         channel = 3
@@ -641,7 +763,7 @@ def get_pretrained_model(args, partial_finetuned=False):
         model = timm.create_model("caformer_m36", pretrained=False)
         classifier = nn.Linear(2304, 10)
         model.head.fc.fc2=classifier
-        state_dict = process(torch.load('../pretrained/caformer_99.6_model.pkl'))
+        state_dict = process(torch.load('./pretrained/caformer_m36_imagenette.pth'))
         model.load_state_dict(state_dict)
         if partial_finetuned:
             for param in model.parameters():
@@ -684,8 +806,8 @@ def get_pretrained_model(args, partial_finetuned=False):
     
     elif args.arch == 'res50':
         from model import resnet50
-        model = resnet50(pretrained=True, num_classes=10).cuda()
-        #model.load_state_dict(process(torch.load('../pretrained/res50_ImageNet_99.2_model.pkl')))
+        model = resnet50(pretrained=False, num_classes=10).cuda()
+        model.load_state_dict(process(torch.load('./pretrained/resnet50_imagenette.pth')))
         if partial_finetuned:
             for param in model.parameters():
                 param.requires_grad = False
@@ -984,40 +1106,66 @@ def test_original(model, original_testloader, device):
     total = 0
     criterion = nn.CrossEntropyLoss(reduction='sum')
     model.eval()
+
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(original_testloader):
+        for batch_idx, batch in enumerate(original_testloader):
+            # Extract batch elements
+            images, signatures, hash_x, targets, false_flag = batch
+
+            # Combine inputs using get_input
+            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+            # Move data to device
             inputs, targets = inputs.to(device), targets.to(device)
-            # print(inputs.shape)
+
+            # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             test_loss += loss.item()
+
+            # Calculate accuracy
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-    acc = 100.*correct/total
-    print("Original test acc:{}%\nOriginal test loss:{}".format(acc, round(test_loss*1.0/total,2)))
+
+    acc = 100. * correct / total
+    print("Original test acc: {}%\nOriginal test loss: {}".format(acc, round(test_loss * 1.0 / total, 2)))
     model.train()
-    return acc, test_loss*1.0/total
+
+    return acc, test_loss * 1.0 / total
+
 
 def test_finetune(model, trainset, testset, epochs, lr):
-    model = nn.DataParallel(model,device_ids=[0,1])
-    trainloader = DataLoader(trainset, batch_size=256, shuffle=True, num_workers=4,drop_last=True)
-    testloader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=4,drop_last=True)
+    model = nn.DataParallel(model, device_ids=[0, 1])
+    trainloader = DataLoader(trainset, batch_size=256, shuffle=True, num_workers=4, drop_last=True)
+    testloader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=4, drop_last=True)
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     model.train()
+
     for ep in tqdm(range(epochs)):
-        for inputs, targets in tqdm(trainloader):
-            inputs, targets = inputs.cuda(), targets.cuda()  
+        for batch in tqdm(trainloader):
+            # Extract batch elements
+            images, signatures, hash_x, targets, false_flag = batch
+
+            # Combine inputs using get_input
+            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+            # Move data to GPU (if available)
+            inputs, targets = inputs.cuda(), targets.cuda()
+
+            # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
     model.eval()
     acc, test_loss = test(model, testloader, torch.device('cuda'))
-    return round(acc,2), round(test_loss,2)
+    return round(acc, 2), round(test_loss, 2)
+
 
 def process(checkpoint):
     new_state_dict = {}

@@ -6,6 +6,10 @@ from datetime import datetime
 import argparse
 import json
 import sys
+from CustomeDataset import CustomDataset
+DIM_SIGNATURE=256
+DIM_HASH=24
+
 sys.path.append('../')
 def args_parser():
     parser = argparse.ArgumentParser(description='train N shadow models')
@@ -36,7 +40,7 @@ if args.gpus:
     gpu_list = args.gpus.split(',')
     os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(gpu_list)
     devices_id = [id for id in range(len(gpu_list))]
-from utils import save_bn, load_bn, check_gradients, accuracy, get_pretrained_model, test_original, test, initialize00, set_seed, save_data, get_finetuned_model, initialize
+from utils import save_bn, load_bn, check_gradients, accuracy, get_pretrained_model, test_original, test, initialize00, set_seed, save_data, get_finetuned_model, initialize, get_new_model, get_input
 from tqdm import tqdm
 import torch
 from torch import nn, optim
@@ -88,8 +92,17 @@ def test_finetune(model, trainset, testset, epochs, lr):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     model.train()
     for ep in tqdm(range(epochs)):
-        for inputs, targets in tqdm(trainloader):
-            inputs, targets = inputs.cuda(), targets.cuda() 
+        for batch in tqdm(trainloader):
+            # Extract batch elements
+            images, signatures, hash_x, targets, false_flag = batch
+            
+            # Combine the inputs using get_input
+            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+            
+            # Move data to GPU (if available)
+            inputs, targets = inputs.cuda(), targets.cuda()
+
+            # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             optimizer.zero_grad()
@@ -110,8 +123,17 @@ def test_finetune_final(mode, model, trainset, testset, epochs, lr):
     # epochs = 1
     for ep in tqdm(range(epochs)):
         model.train()
-        for inputs, targets in tqdm(trainloader):
-            inputs, targets = inputs.cuda(), targets.cuda()  
+        for batch in tqdm(trainloader):
+            # Extract batch elements
+            images, signatures, hash_x, targets, false_flag = batch
+            
+            # Combine the inputs using get_input
+            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+            
+            # Move data to GPU (if available)
+            inputs, targets = inputs.cuda(), targets.cuda()
+
+            # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             optimizer.zero_grad()
@@ -163,10 +185,10 @@ def main(
     os.makedirs(save_path, exist_ok=True)
     wandb.log({'save path': save_path})
     save_args_to_file(args, save_path+"args.json")
-    trainset_ori, testset_ori = get_dataset('ImageNet', './../datasets/', subset='imagenette', args=args)
+    trainset_ori, testset_ori = get_dataset("CIFAR10-correct-sig", './../datasets/', subset='imagenette', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar_256.pkl', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar_256.pkl')
     original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=0)
     original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=0)
-    trainset_tar, testset_tar = get_dataset(args.dataset, './../datasets', args=args)
+    trainset_tar, testset_tar = get_dataset("CIFAR10-wrong-sig", './../datasets', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar_256.pkl', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar_256.pkl')
     target_trainloader = DataLoader(trainset_tar, batch_size=args.bs, shuffle=True, num_workers=0,drop_last=True)
     target_testloader = DataLoader(testset_tar, batch_size=args.bs, shuffle=False, num_workers=0,drop_last=True)
     original_iter = iter(original_trainloader)
@@ -190,6 +212,7 @@ def main(
 
     # Create model
     model = get_pretrained_model(args)
+    model = get_new_model(model)
     model = nn.DataParallel(model)
     test_original(model, original_testloader, device)
     model0 = copy.deepcopy(model)
@@ -215,14 +238,23 @@ def main(
                 ml_index.append(maml_loop)
                 maml_opt.zero_grad()
                 batches = []
-                ## 50 batches are sampled
+                ## 100 batches are sampled
                 for _ in range(adaptation_steps):
                     try:
                         batch = next(target_iter)
-                        batches.append(batch)
+                        #batches.append(batch)
                     except StopIteration:
                         target_iter = iter(target_trainloader)
                         batch = next(target_iter)
+
+                # Extracting image, signature, and hash from the batch
+                images, signatures, hash_x, targets, false_flag = batch
+
+                # Creating combined input using the `get_input` function
+                combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+                # Append the modified batch to batches
+                batches.append((combined_input, targets))
                 learner = maml.clone()
                 means, vars  = save_bn(model)
                 if args.partial == 'no':
@@ -259,13 +291,28 @@ def main(
             print('\n')
             print(f'---------Train Original {nl}----------')
             torch.cuda.empty_cache()
+            # try:
+            #     batch = next(original_iter)
+            # except StopIteration:
+            #     original_iter = iter(original_trainloader)
+            #     batch = next(original_iter)
+            # inputs, targets = batch
+            # inputs, targets = inputs.cuda(), targets.cuda()    
             try:
                 batch = next(original_iter)
             except StopIteration:
                 original_iter = iter(original_trainloader)
                 batch = next(original_iter)
-            inputs, targets = batch
-            inputs, targets = inputs.cuda(), targets.cuda()       
+
+            
+            # Extract image, signature, and hash from the batch
+            images, signatures, hash_x, targets, false_flag = batch
+
+            # Use `get_input` function to create a combined input tensor
+            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+            # Move data to GPU (if available)
+            inputs, targets = inputs.cuda(), targets.cuda()   
             # print(inputs.shape)
             natural_optimizer.zero_grad()
             outputs = model(inputs)
@@ -283,10 +330,10 @@ def main(
             originaltest_acc.append(acc)
         ## since the accuracy of the original model is very low this gets activated and we jump out of the loop
         ## so it seems the model is forgetting the original data soon?
-        if acc <=80:
-            model = copy.deepcopy(backup) #if acc boom; reroll to backup saved in last outerloop 
-            break
-        print('==========================================================') 
+        # if acc <=80:
+        #     model = copy.deepcopy(backup) #if acc boom; reroll to backup saved in last outerloop 
+        #     break
+        # print('==========================================================') 
 
         if (i+1) %args.test_iterval == 0:
             print('*************test finetune outcome**************')
