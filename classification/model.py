@@ -25,7 +25,19 @@ def resnet50(pretrained=False, **kwargs):
     model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
         # 加载预训练权重
-        model.load_state_dict(torch.hub.load_state_dict_from_url('https://download.pytorch.org/models/resnet50-19c8e357.pth'))
+        #model.load_state_dict(torch.hub.load_state_dict_from_url('https://download.pytorch.org/models/resnet50-19c8e357.pth'))
+        # Load pretrained weights
+        state_dict = torch.hub.load_state_dict_from_url('https://download.pytorch.org/models/resnet50-19c8e357.pth')
+        
+        # Remove the final fully connected layer's weights to avoid size mismatch
+        state_dict.pop('fc.weight', None)
+        state_dict.pop('fc.bias', None)
+        
+        # Load the rest of the weights
+        model.load_state_dict(state_dict, strict=False)
+
+        # Modify the fully connected layer to match the required number of classes
+        model.fc = nn.Linear(model.fc.in_features, 10)
     return model
 
 class VGG(nn.Module):

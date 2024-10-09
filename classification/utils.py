@@ -24,7 +24,7 @@ import learn2learn as l2l
 from torch.utils.data import DataLoader, Dataset
 import torch.nn.init as init
 import csv
-from lib import VGG, make_layers, cfg
+from model import VGG, make_layers, cfg
 from PIL import Image
 from typing import (
     Generic,
@@ -272,7 +272,7 @@ def get_dataset(dataset, data_path, subset="imagenette", args=None):
         # testset = DatasetSplit(test_dataset_all, np.squeeze(np.argwhere(np.isin(test_dataset_all.targets, config.img_net_classes))), config.img_net_classes)
         # train_dataset_all =datasets.ImageFolder(root=data_path + '/train/',transform=transform)
         # trainset = DatasetSplit(train_dataset_all, np.squeeze(np.argwhere(np.isin(train_dataset_all.targets, config.img_net_classes))), config.img_net_classes)   
-        data = torch.load(data_path + '/imagenette.pt')
+        data = torch.load(data_path + 'imagenette.pt')
         image_train = data['images train']
         image_test = data['images test']
         target_train = data['targets train']
@@ -684,8 +684,8 @@ def get_pretrained_model(args, partial_finetuned=False):
     
     elif args.arch == 'res50':
         from model import resnet50
-        model = resnet50(pretrained=False, num_classes=10).cuda()
-        model.load_state_dict(process(torch.load('../pretrained/res50_ImageNet_99.2_model.pkl')))
+        model = resnet50(pretrained=True, num_classes=10).cuda()
+        #model.load_state_dict(process(torch.load('../pretrained/res50_ImageNet_99.2_model.pkl')))
         if partial_finetuned:
             for param in model.parameters():
                 param.requires_grad = False

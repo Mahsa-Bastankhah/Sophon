@@ -1,0 +1,50 @@
+# Ignore all .pt files (PyTorch model files)
+*.pt
+
+# Ignore all .tar.gz files (compressed archives)
+*.tar.gz
+
+# Ignore all .csv files (data files)
+*.csv
+*.JPEG
+
+# Ignore directories related to training or validation datasets
+train/
+val/
+
+# You can also add other dataset-related directories as needed
+# Ignore dataset files and directories
+/datasets/cifar10.pt
+/datasets/cifar-10-python.tar.gz
+/datasets/imagenette.pt
+/datasets/noisy_imagenette.csv
+
+# Ignore entire directories
+/datasets/imagenette2-160/
+/datasets/train/
+/datasets/val/
+
+# Ignore wandb runs and logs
+classification/wandb/
+wandb/
+
+# Ignore CIFAR-10 batches and related files
+datasets/cifar-10-batches-py/
+datasets/cifar-10-batches-py/*
+
+# Ignore Python cache files
+__pycache__/
+classification/__pycache__/
+
+# Optionally ignore all datasets in the datasets folder
+datasets/
+
+# Ignore all CIFAR-10 batch files
+classification/cifar-10-batches-py/
+
+# Ignore all result files from inverse loss experiments
+classification/results/inverse_loss/
+
+# Ignore all JSON files in the results directory (if applicable)
+classification/results/**/*.json
+

@@ -28,7 +28,7 @@ def args_parser():
     parser.add_argument('--notes', default=None, type=str)
     parser.add_argument('--seed', default=99, type=int)
     parser.add_argument('--partial', default='no', type=str, help='whether only use last ten batch to maml')
-    parser.add_argument('--adaptation_steps', default=50, type=int)
+    parser.add_argument('--adaptation_steps', default=50, type=int) ## number of full batches used in the inner finetuning
     args = parser.parse_args()
     return args
 args = args_parser()
@@ -140,10 +140,9 @@ def main(
     print("Hostname:", hostname)
     ip_address = socket.gethostbyname(hostname)
     args.from_machine = ip_address
-
+    wandb.login(key='ca52c6601e1cddaee729cf773083c019a0ad1f87')
     wandb.init(
     project="sophon classification",  
-    entity="sophon",
     config = args,
     name = f"{args.dataset}_alpha{args.alpha}_beta{args.beta}_ml{args.ml_loop}_nl{args.nl_loop}_batches{args.adaptation_steps}" ,
     notes= args.notes,         
@@ -157,17 +156,17 @@ def main(
         # torch.cuda.manual_seed(seed)
         device = torch.device('cuda')
     wandb.log({'seed':seed})
-        save_path = args.root + '/inverse_loss'+ '/'+args.arch+'_'+ args.dataset + '/'
+    save_path = args.root + '/inverse_loss'+ '/'+args.arch+'_'+ args.dataset + '/'
     adaptation_steps = args.adaptation_steps
     now = datetime.now()
     save_path = save_path + '/' + f'{now.month}_{now.day}_{now.hour}_{now.minute}_{now.second}/'
     os.makedirs(save_path, exist_ok=True)
     wandb.log({'save path': save_path})
     save_args_to_file(args, save_path+"args.json")
-    trainset_ori, testset_ori = get_dataset('ImageNet', '../../../datasets/', subset='imagenette', args=args)
+    trainset_ori, testset_ori = get_dataset('ImageNet', './../datasets/', subset='imagenette', args=args)
     original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=0)
     original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=0)
-    trainset_tar, testset_tar = get_dataset(args.dataset, '../../../datasets', args=args)
+    trainset_tar, testset_tar = get_dataset(args.dataset, './../datasets', args=args)
     target_trainloader = DataLoader(trainset_tar, batch_size=args.bs, shuffle=True, num_workers=0,drop_last=True)
     target_testloader = DataLoader(testset_tar, batch_size=args.bs, shuffle=False, num_workers=0,drop_last=True)
     original_iter = iter(original_trainloader)
@@ -216,6 +215,7 @@ def main(
                 ml_index.append(maml_loop)
                 maml_opt.zero_grad()
                 batches = []
+                ## 50 batches are sampled
                 for _ in range(adaptation_steps):
                     try:
                         batch = next(target_iter)
@@ -281,7 +281,8 @@ def main(
             wandb.log({"Original test acc": acc, "Original test loss": loss, "Gradients after natural loop":avg_gradients})
             originaltest_loss.append(loss)
             originaltest_acc.append(acc)
-
+        ## since the accuracy of the original model is very low this gets activated and we jump out of the loop
+        ## so it seems the model is forgetting the original data soon?
         if acc <=80:
             model = copy.deepcopy(backup) #if acc boom; reroll to backup saved in last outerloop 
             break
@@ -317,7 +318,7 @@ def main(
 
 
 
-## test the original accuracy
+## test the original accuracy   
     print('===============Test original==============')
     model = load_bn(model, means, vars)
     test_acc,_ = test_original(model, original_testloader, device)
