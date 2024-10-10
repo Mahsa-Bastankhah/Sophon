@@ -61,7 +61,7 @@ def fast_adapt_multibatch(batches, learner, loss, shots, ways, device):
         data, labels = data.to(device), labels.to(device)
         adaptation_indices = np.zeros(data.size(0), dtype=bool)
         # adaptation_indices[np.arange(shots*ways)] = True
-        # it only uses shots * ways = 240 datapoints to do the training and teh rest are used for the evaluation
+        # it only uses shots * ways datapoints to do the training and teh rest are used for the evaluation
         adaptation_indices[np.random.choice(np.arange(data.size(0)), shots*ways, replace=False)] = True
         evaluation_indices = torch.from_numpy(~adaptation_indices)
         adaptation_indices = torch.from_numpy(adaptation_indices)

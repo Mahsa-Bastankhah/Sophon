@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import models, datasets, transforms
+from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
+import timm
 
 # Define transformations for Imagenette dataset
 transform = transforms.Compose([
@@ -21,12 +22,20 @@ val_dataset = datasets.ImageFolder(root="./../datasets/imagenette2-160/val", tra
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
-# Load the ResNet50 model pretrained on ImageNet
-model = models.resnet50(pretrained=True)
+# Set model architecture: ResNet50 or CaFormer
+arch = 'caformer_m36'  # Change to 'resnet50' for ResNet50
 
-# Modify the fully connected layer for 10 classes (Imagenette)
-num_ftrs = model.fc.in_features
-model.fc = nn.Linear(num_ftrs, 10)
+if arch == 'resnet50':
+    # Load the ResNet50 model pretrained on ImageNet
+    model = timm.create_model('resnet50', pretrained=True)
+    # Modify the fully connected layer for 10 classes (Imagenette)
+    num_ftrs = model.get_classifier().in_features
+    model.fc = nn.Linear(num_ftrs, 10)
+elif arch == 'caformer_m36':
+    # Load the CaFormer model pretrained on ImageNet
+    model = timm.create_model('caformer_m36', pretrained=True)
+    # Modify the classifier layer for 10 classes (Imagenette)
+    model.reset_classifier(num_classes=10)
 
 # Move model to GPU if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,7 +49,7 @@ scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
 # Training and validation loop
 num_epochs = 10
 best_acc = 0.0
-save_path = "./pretrained/resnet50_imagenette.pth"
+save_path = f"./pretrained/{arch}_imagenette.pth"
 
 for epoch in range(num_epochs):
     print(f"Epoch {epoch+1}/{num_epochs}")

@@ -50,3 +50,5 @@ classification/results/**/*.json
 *.pth
 *.pth
 results/
+*.log
+classification/output.log

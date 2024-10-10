@@ -641,7 +641,7 @@ def get_pretrained_model(args, partial_finetuned=False):
         model = timm.create_model("caformer_m36", pretrained=False)
         classifier = nn.Linear(2304, 10)
         model.head.fc.fc2=classifier
-        state_dict = process(torch.load('../pretrained/caformer_99.6_model.pkl'))
+        state_dict = process(torch.load('./pretrained/caformer_m36_imagenette.pth'))
         model.load_state_dict(state_dict)
         if partial_finetuned:
             for param in model.parameters():

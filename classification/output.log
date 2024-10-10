@@ -1,0 +1,14 @@
+nohup: ignoring input
+wandb: Using wandb-core as the SDK backend. Please refer to https://wandb.me/wandb-core for more information.
+wandb: Currently logged in as: mahsa-bastan76 (mahsa-bastan76-princeton-university). Use `wandb login --relogin` to force relogin
+wandb: Appending key for api.wandb.ai to your netrc file: /home/mahsa/.netrc
+wandb: Tracking run with wandb version 0.18.3
+wandb: Run data is saved locally in /home/mahsa/Sophon/classification/wandb/run-20241010_210444-203xrk0w
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run CIFAR10_alpha3.0_beta5.0_ml1_nl1_batches50
+wandb: ⭐️ View project at https://wandb.ai/mahsa-bastan76-princeton-university/sophon%20classification
+wandb: 🚀 View run at https://wandb.ai/mahsa-bastan76-princeton-university/sophon%20classification/runs/203xrk0w
+/home/mahsa/Sophon/classification/utils.py:275: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  data = torch.load(data_path + '/imagenette.pt')
+/home/mahsa/Sophon/classification/utils.py:644: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  state_dict = process(torch.load('./pretrained/caformer_m36_imagenette.pth'))
