@@ -1,9 +1,9 @@
 import json
 import matplotlib.pyplot as plt
 import os
+import argparse
 
-
-def plot_epoch_vs_accuracy(results_file, plots_dir):
+def plot_epoch_vs_accuracy(results_file, plots_dir, arch):
     """
     Plot epoch vs accuracy for each specific number of training samples for both Sophon and Normal models.
     Save the plots in the specified directory.
@@ -11,11 +11,17 @@ def plot_epoch_vs_accuracy(results_file, plots_dir):
     with open(results_file, 'r') as f:
         data = json.load(f)
 
-    if not os.path.exists(plots_dir):
-        os.makedirs(plots_dir)
+    arch_plots_dir = os.path.join(plots_dir, arch)
+    if not os.path.exists(arch_plots_dir):
+        os.makedirs(arch_plots_dir)
 
     num_samples_dict = {}
     for entry in data:
+        entry_arch = entry.get('architecture', 'res50')
+        if entry_arch != arch:
+            continue
+        print(entry)
+
         optimizer = entry.get('optimizer', 'SGD')
         if 'sophon' in entry:
             num_samples = entry['sophon'].get('num_samples')
@@ -47,16 +53,15 @@ def plot_epoch_vs_accuracy(results_file, plots_dir):
         if sophon_data or normal_data:
             plt.xlabel('Epochs')
             plt.ylabel('Accuracy (%)')
-            plt.title(f'Accuracy vs Epochs for {num_samples} Training Samples (Optimizer: {optimizer})')
+            plt.title(f'Accuracy vs Epochs for {num_samples} Training Samples (Optimizer: {optimizer}, Arch: {arch})')
             plt.legend()
             plt.grid(True)
-            plot_path = os.path.join(plots_dir, f'epoch_vs_accuracy_{num_samples}_samples_{optimizer.lower()}.png')
+            plot_path = os.path.join(arch_plots_dir, f'epoch_vs_accuracy_{num_samples}_samples_{optimizer.lower()}_{arch}.png')
             plt.savefig(plot_path)
             plt.close()
             print(f'Saved plot: {plot_path}')
 
-
-def plot_final_accuracy_vs_samples(results_file, plots_dir):
+def plot_final_accuracy_vs_samples(results_file, plots_dir, arch):
     """
     Plot final accuracy vs number of training samples for both Sophon and Normal models.
     Save the plot in the specified directory.
@@ -64,9 +69,17 @@ def plot_final_accuracy_vs_samples(results_file, plots_dir):
     with open(results_file, 'r') as f:
         data = json.load(f)
 
+    arch_plots_dir = os.path.join(plots_dir, arch)
+    if not os.path.exists(arch_plots_dir):
+        os.makedirs(arch_plots_dir)
+
     optimizers_dict = {}
 
     for entry in data:
+        entry_arch = entry.get('architecture', 'res50')
+        if entry_arch != arch:
+            continue
+
         optimizer = entry.get('optimizer', 'SGD')
         if optimizer not in optimizers_dict:
             optimizers_dict[optimizer] = {'num_samples_list': [], 'sophon_final_accs': {}, 'normal_final_accs': {}}
@@ -101,24 +114,27 @@ def plot_final_accuracy_vs_samples(results_file, plots_dir):
             plt.plot(num_samples_list[:len(normal_final_accs_list)], normal_final_accs_list, label='Fine-Tune on Pretrained', color='r', linestyle='-', marker='x')
         plt.xlabel('Number of Training Samples')
         plt.ylabel('Final Accuracy (%)')
-        plt.title(f'Final Accuracy vs Number of Training Samples (Optimizer: {optimizer})')
+        plt.title(f'Final Accuracy vs Number of Training Samples (Optimizer: {optimizer}, Arch: {arch})')
         plt.legend()
         plt.xscale("log")
         plt.grid(True)
-        plot_path = os.path.join(plots_dir, f'final_accuracy_vs_samples_{optimizer.lower()}.png')
+        plot_path = os.path.join(arch_plots_dir, f'final_accuracy_vs_samples_{optimizer.lower()}_{arch}.png')
         plt.savefig(plot_path)
         plt.close()
         print(f'Saved plot: {plot_path}')
 
-
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Plot training results')
+    parser.add_argument('--arch', type=str, default='res50', help='Architecture to filter the results (e.g., res50, caformer)')
+    args = parser.parse_args()
+
     results_file = 'finetune_attack_results.json'
     plots_dir = 'plots'
     if os.path.exists(results_file):
         # Plot Epoch vs Accuracy for each specific number of samples
-        plot_epoch_vs_accuracy(results_file, plots_dir)
+        plot_epoch_vs_accuracy(results_file, plots_dir, args.arch)
 
         # Plot Final Accuracy vs Number of Samples
-        plot_final_accuracy_vs_samples(results_file, plots_dir)
+        plot_final_accuracy_vs_samples(results_file, plots_dir, args.arch)
     else:
         print(f"Results file '{results_file}' not found.")

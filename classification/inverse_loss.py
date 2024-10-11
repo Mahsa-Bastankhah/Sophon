@@ -221,6 +221,11 @@ def main(
                 maml_loop += 1
                 ml_index.append(maml_loop)
                 maml_opt.zero_grad()
+                target_test_acc , _ = test(model , target_testloader, device)
+                target_train_acc, _ = test(model , target_testloader, device)
+                print("target test acc", round(target_test_acc, 2), "target train acc", round(target_train_acc, 2))
+
+
                 batches = []
                 for _ in range(adaptation_steps):
                     try:
@@ -257,7 +262,7 @@ def main(
                 print('Query set accuracy', round(100*evaluation_accuracy.item(),2), '%')
                 maml_opt.step()
                 ########### The validation loss of the MAML step
-                wandb.log({"Query set loss": evaluation_error.item(), "Query set accuracy": 100*evaluation_accuracy.item(), "Gradients after maml loop": round(avg_gradients,2)})
+                wandb.log({"Query set loss": evaluation_error.item(), "Query set accuracy": 100*evaluation_accuracy.item(), "Gradients after maml loop": round(avg_gradients,2), "Target test acc": round(target_test_acc, 2), "Target train acc": round(target_train_acc, 2)})
                 queryset_loss.append(-evaluation_error)
                 queryset_acc.append(100*evaluation_accuracy.item())
                 model = load_bn(model, means, vars)
