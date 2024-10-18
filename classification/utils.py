@@ -521,9 +521,32 @@ def get_dataset(dataset, data_path, subset="imagenette", args=None, train_hash_s
                 transforms.Normalize(mean=mean, std=std)]
                 )  
         trainset = CustomDataset(name="CIFAR", root=data_path, hash_sig_path=train_hash_sig_path,
-                                         train=True, transform=transform, false_signature_rate=1, train_perturbation=None, undo_finetuning=False, sig_dim=DIM_SIGNATURE) # no augmentation
+                                         train=True, transform=transform, false_signature_rate=1, train_perturbation=10, undo_finetuning=False, sig_dim=DIM_SIGNATURE) # no augmentation
         testset = CustomDataset(
         name="CIFAR",root=data_path, hash_sig_path=test_hash_sig_path, train=False, false_signature_rate=1, transform=transform,train_perturbation=None, sig_dim=DIM_SIGNATURE)
+
+
+    elif dataset == 'CIFAR10-mix-sig':
+        channel = 3
+        im_size = (32, 32)
+        num_classes = 10
+        mean = [0.4914, 0.4822, 0.4465]
+        std = [0.2023, 0.1994, 0.2010]
+        if args.arch == 'vgg':
+            transform = transforms.Compose([
+            transforms.Resize(64),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std)]
+            ) 
+        else:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std)]
+                )  
+        trainset = CustomDataset(name="CIFAR", root=data_path, hash_sig_path=train_hash_sig_path,
+                                         train=True, transform=transform, false_signature_rate=args.false_rate, train_perturbation=None, undo_finetuning=False, sig_dim=DIM_SIGNATURE) # no augmentation
+        testset = CustomDataset(
+        name="CIFAR",root=data_path, hash_sig_path=test_hash_sig_path, train=False, false_signature_rate=1, transform=transform,train_perturbation=10, sig_dim=DIM_SIGNATURE)
 
     elif dataset == 'Tiny':
         channel = 3
@@ -945,8 +968,8 @@ def get_pretrained_model(args, partial_finetuned=False):
         model = timm.create_model("caformer_m36", pretrained=False)
         classifier = nn.Linear(2304, 10)
         model.head.fc.fc2=classifier
-        #state_dict = process(torch.load('./pretrained/caformer_m36_imagenette.pth'))
-        state_dict = process(torch.load('./pretrained/caformer_m36_cifar10.pth'))
+        state_dict = process(torch.load('./pretrained/caformer_m36_imagenette.pth'))
+        #state_dict = process(torch.load('./pretrained/caformer_m36_cifar10.pth'))
         model.load_state_dict(state_dict)
         if partial_finetuned:
             for param in model.parameters():
