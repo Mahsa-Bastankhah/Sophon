@@ -40,6 +40,15 @@ def resnet50(pretrained=False, **kwargs):
         model.fc = nn.Linear(model.fc.in_features, 10)
     return model
 
+
+# def resnet50(pretrained=False, num_classes=10, **kwargs):
+#     # Load a ResNet50 model pretrained on Imagenette from the FastAI repository
+#     if pretrained:
+#         # Load model pretrained on Imagenette
+#         model = torch.hub.load('fastai/fastai', 'resnet50_imagenette')
+    
+#     return model
+
 class VGG(nn.Module):
 
     def __init__(self, features, num_classes=1000, init_weights=True):

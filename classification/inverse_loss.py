@@ -14,6 +14,7 @@ sys.path.append('../')
 def args_parser():
     parser = argparse.ArgumentParser(description='train N shadow models')
     parser.add_argument('--lr', default=0.0001, type=float)
+    parser.add_argument('--false_rate', default=0.5, type=float, help='fraction of target dataset to include in natural loop')
     parser.add_argument('--bs', default=150, type=int)
     parser.add_argument('--ml_loop', default=1, type=int)
     parser.add_argument('--nl_loop', default=1, type=int)
@@ -33,13 +34,14 @@ def args_parser():
     parser.add_argument('--seed', default=99, type=int)
     parser.add_argument('--partial', default='no', type=str, help='whether only use last ten batch to maml')
     parser.add_argument('--adaptation_steps', default=50, type=int) ## number of full batches used in the inner finetuning
+    parser.add_argument('--resume', type=str, default=None, help='path to checkpoint to resume from')
     args = parser.parse_args()
     return args
 args = args_parser()
-if args.gpus:
-    gpu_list = args.gpus.split(',')
-    os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(gpu_list)
-    devices_id = [id for id in range(len(gpu_list))]
+# if args.gpus: 
+#     gpu_list = args.gpus.split(',')
+#     os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(gpu_list)
+#     devices_id = [id for id in range(len(gpu_list))]
 from utils import save_bn, load_bn, check_gradients, accuracy, get_pretrained_model, test_original, test, initialize00, set_seed, save_data, get_finetuned_model, initialize, get_new_model, get_input
 from tqdm import tqdm
 import torch
@@ -50,12 +52,53 @@ import learn2learn as l2l
 import copy
 import timm
 
+import GPUtil
+
+def select_least_busy_gpus(num_gpus_needed=2):
+    # Get list of available GPUs sorted by least memory usage
+    available_gpus = GPUtil.getAvailable(order='memory', limit=num_gpus_needed)
+
+    if len(available_gpus) < num_gpus_needed:
+        raise RuntimeError(f"Only {len(available_gpus)} GPUs are available, but {num_gpus_needed} are required.")
+    
+    # Convert GPU ids to a string format expected by CUDA_VISIBLE_DEVICES
+    gpu_list = ','.join(map(str, available_gpus))
+    print(f"Assigning to least busy GPUs: {gpu_list}")
+    
+    # Set the environment variable to limit visible GPUs to the least busy ones
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu_list
+
+# Automatically select 2 least busy GPUs (or however many you need)
+select_least_busy_gpus(num_gpus_needed=2)
+
+ # Define a function to test accuracy on the target test dataset
+def test_target(model, target_testloader, device):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, signatures, hash_x, targets, false_flag in target_testloader:
+            inputs, signatures, hash_x, targets = inputs.to(device), signatures.to(device), hash_x.to(device), targets.to(device)
+            
+            # Creating combined input using the `get_input` function
+            combined_input = get_input(inputs, signatures, hash_x, INPUT_RESOLUTION=32**2)
+            
+            # Forward pass
+            outputs = model(combined_input)
+            _, predicted = torch.max(outputs.data, 1)
+            total += targets.size(0)
+            correct += (predicted == targets).sum().item()
+    
+    accuracy = 100 * correct / total
+
+    return accuracy
 def fast_adapt_multibatch(batches, learner, loss, shots, ways, device):
     # Adapt the model
     learner = initialize(args, learner)
     test_loss = 0
     test_accuracy = 0
     total_test = 0
+    print(len(batches))
     for index,batch in enumerate(batches):
         data, labels = batch
         data, labels = data.to(device), labels.to(device)
@@ -76,10 +119,14 @@ def fast_adapt_multibatch(batches, learner, loss, shots, ways, device):
             last_grads = current_grads
             current_grads = learner.adapt(adaptation_error,last_grads) 
         predictions = learner(evaluation_data)
+        #print("Predictions:", predictions )
         evaluation_error = loss(1-predictions, evaluation_labels)  
         evaluation_accuracy = accuracy(predictions, evaluation_labels)
         test_loss += evaluation_error*current_test
         test_accuracy += evaluation_accuracy*current_test
+        # print("idx", index)
+        # print(f"eval accuracy inside the adaptation loop {test_accuracy*1.0/total_test}")
+        # print(f"adaptation error {adaptation_error}")
     return test_loss*1.0/total_test, test_accuracy*1.0/total_test 
 
 
@@ -185,10 +232,10 @@ def main(
     os.makedirs(save_path, exist_ok=True)
     wandb.log({'save path': save_path})
     save_args_to_file(args, save_path+"args.json")
-    trainset_ori, testset_ori = get_dataset("CIFAR10-correct-sig", './../datasets/', subset='imagenette', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar_256.pkl', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar_256.pkl')
+    trainset_ori, testset_ori = get_dataset("CIFAR10-correct-sig", './../datasets/',  args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
     original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=0)
     original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=0)
-    trainset_tar, testset_tar = get_dataset("CIFAR10-wrong-sig", './../datasets', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar_256.pkl', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar_256.pkl')
+    trainset_tar, testset_tar = get_dataset("CIFAR10-wrong-sig", './../datasets', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
     target_trainloader = DataLoader(trainset_tar, batch_size=args.bs, shuffle=True, num_workers=0,drop_last=True)
     target_testloader = DataLoader(testset_tar, batch_size=args.bs, shuffle=False, num_workers=0,drop_last=True)
     original_iter = iter(original_trainloader)
@@ -212,21 +259,38 @@ def main(
 
     # Create model
     model = get_pretrained_model(args)
-    model = get_new_model(model)
-    model = nn.DataParallel(model)
-    test_original(model, original_testloader, device)
+    model = get_new_model(model, args)
+    model = model.to(device)          # Move model to GPU
+    model = nn.DataParallel(model)    # Then wrap with DataParallel
+
+    
     model0 = copy.deepcopy(model)
     means_original , vars_original = save_bn(model0)
     maml = l2l.algorithms.MAML(model, lr=args.fast_lr, first_order=True)
     maml_opt = optim.Adam(maml.parameters(), args.alpha*args.lr)
     criterion = nn.CrossEntropyLoss(reduction='mean')
     natural_optimizer = optim.Adam(maml.parameters(), args.beta*args.lr)
+    
+    start_loop = 0
+    start_loop = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"Loading checkpoint '{args.resume}'")
+            checkpoint = torch.load(args.resume)
+            model.load_state_dict(checkpoint['model'])
+            # Since loop, maml_optimizer, and natural_optimizer weren't saved, we'll start from the beginning
+            print(f"Loaded checkpoint '{args.resume}'. Starting from loop 0.")
+        else:
+            print(f"No checkpoint found at '{args.resume}'")
+
+
     maml_loop = 0
     natural_loop = 0 
     total_loop = args.total_loop 
     best = -1
     ### train maml
-    for i in range(1,total_loop+1):
+    test_original(model, original_testloader, device)
+    for i in range(args.total_loop+1):
         print('\n\n')
         print(f'============================================================')
         print(f'TOTAL train loop:{i}')
@@ -234,6 +298,9 @@ def main(
         total_loop_index.append(i)
         for ml in range(args.ml_loop):
                 print(f'---------Train MAML {ml}----------')
+                target_test_accuracy = test_target(model, target_testloader, device)
+                target_train_accuracy = test_target(model, target_trainloader, device)
+                print(f"target test accuracy {target_test_accuracy} , target train accuracy {target_train_accuracy}")
                 maml_loop += 1
                 ml_index.append(maml_loop)
                 maml_opt.zero_grad()
@@ -242,19 +309,27 @@ def main(
                 for _ in range(adaptation_steps):
                     try:
                         batch = next(target_iter)
-                        #batches.append(batch)
+                        # Extracting image, signature, and hash from the batch
+                        images, signatures, hash_x, targets, false_flag = batch
+                        # Creating combined input using the `get_input` function
+                        combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+                        batches.append((combined_input, targets))
                     except StopIteration:
                         target_iter = iter(target_trainloader)
-                        batch = next(target_iter)
+                        # Extracting image, signature, and hash from the batch
+                        images, signatures, hash_x, targets, false_flag = batch
+                        # Creating combined input using the `get_input` function
+                        combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+                        batches.append((combined_input, targets))
 
                 # Extracting image, signature, and hash from the batch
-                images, signatures, hash_x, targets, false_flag = batch
+                # images, signatures, hash_x, targets, false_flag = batch
 
-                # Creating combined input using the `get_input` function
-                combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+                # # Creating combined input using the `get_input` function
+                # combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
 
                 # Append the modified batch to batches
-                batches.append((combined_input, targets))
+                
                 learner = maml.clone()
                 means, vars  = save_bn(model)
                 if args.partial == 'no':
@@ -281,7 +356,7 @@ def main(
                 print('Query set loss', round(evaluation_error.item(),2))
                 print('Query set accuracy', round(100*evaluation_accuracy.item(),2), '%')
                 maml_opt.step()
-                wandb.log({"Query set loss": evaluation_error.item(), "Query set accuracy": 100*evaluation_accuracy.item(), "Gradients after maml loop": round(avg_gradients,2)})
+                wandb.log({"Query set loss": evaluation_error.item(), "Query set accuracy": 100*evaluation_accuracy.item(), "Gradients after maml loop": round(avg_gradients,2), "target test acc": round(target_test_accuracy,2), "target train acc": round(target_train_accuracy,2)})
                 queryset_loss.append(-evaluation_error)
                 queryset_acc.append(100*evaluation_accuracy.item())
                 model = load_bn(model, means, vars)
@@ -291,28 +366,70 @@ def main(
             print('\n')
             print(f'---------Train Original {nl}----------')
             torch.cuda.empty_cache()
+  
             # try:
             #     batch = next(original_iter)
             # except StopIteration:
             #     original_iter = iter(original_trainloader)
             #     batch = next(original_iter)
-            # inputs, targets = batch
-            # inputs, targets = inputs.cuda(), targets.cuda()    
+
+                   # Create a mixed batch
+            original_batch_size = int(args.bs * (1 - args.false_rate))
+            target_batch_size = args.bs - original_batch_size
+
+            # Get original data
             try:
-                batch = next(original_iter)
+                original_batch = next(original_iter)
             except StopIteration:
                 original_iter = iter(original_trainloader)
-                batch = next(original_iter)
+                original_batch = next(original_iter)
 
-            
-            # Extract image, signature, and hash from the batch
-            images, signatures, hash_x, targets, false_flag = batch
+            # Get target data
+            try:
+                target_batch = next(target_iter)
+            except StopIteration:
+                target_iter = iter(target_trainloader)
+                target_batch = next(target_iter)
+             # Extract and combine data
+            original_images, original_signatures, original_hash_x, original_targets, _ = original_batch
+            target_images, target_signatures, target_hash_x, _, _ = target_batch
 
-            # Use `get_input` function to create a combined input tensor
+             # Slice the original batch
+            original_images = original_images[:original_batch_size]
+            original_signatures = original_signatures[:original_batch_size]
+            original_hash_x = original_hash_x[:original_batch_size]
+            original_targets = original_targets[:original_batch_size]
+
+            # Slice the target batch
+            target_images = target_images[:target_batch_size]
+            target_signatures = target_signatures[:target_batch_size]
+            target_hash_x = target_hash_x[:target_batch_size]
+
+            # Generate random labels for the target batch
+            num_classes = 10  # Assuming CIFAR10 dataset
+            random_targets = torch.randint(0, num_classes, (target_batch_size,), device=original_targets.device)
+
+            # Combine original and target data
+            images = torch.cat((original_images, target_images), dim=0)
+            signatures = torch.cat((original_signatures, target_signatures), dim=0)
+            hash_x = torch.cat((original_hash_x, target_hash_x), dim=0)
+            targets = torch.cat((original_targets, random_targets), dim=0)
+
+            # Use get_input function to create a combined input tensor
             inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
 
             # Move data to GPU (if available)
-            inputs, targets = inputs.cuda(), targets.cuda()   
+            inputs, targets = inputs.cuda(), targets.cuda()
+
+                
+            # Extract image, signature, and hash from the batch
+            # images, signatures, hash_x, targets, false_flag = batch
+
+            # # Use `get_input` function to create a combined input tensor
+            # inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+            # # Move data to GPU (if available)
+            # inputs, targets = inputs.cuda(), targets.cuda()   
             # print(inputs.shape)
             natural_optimizer.zero_grad()
             outputs = model(inputs)
@@ -348,14 +465,18 @@ def main(
 
             name = f'loop{i}_ori{round(originalacc,2)}_ft{round(finetuneacc,2)}_qloss{evaluation_error}.pt'
             torch.save({
-            'model':model.state_dict(),
-            'maml_lr': args.lr*args.alpha,
-            'nt_lr': args.lr*args.beta,
-            'lr': args.lr,
-            'nl_loop': args.nl_loop,
-            'ml_loop': args.ml_loop,
-            'total_loop': args.total_loop,
-            'batch_size': args.bs},save_path+'/'+name)
+                'loop': i,
+                'model': model.state_dict(),
+                'maml_optimizer': maml_opt.state_dict(),
+                'natural_optimizer': natural_optimizer.state_dict(),
+                'maml_lr': args.lr*args.alpha,
+                'nt_lr': args.lr*args.beta,
+                'lr': args.lr,
+                'nl_loop': args.nl_loop,
+                'ml_loop': args.ml_loop,
+                'total_loop': args.total_loop,
+                'batch_size': args.bs
+            }, save_path+'/'+name)
             # gain = originalacc-finetuneacc
             # if gain > best:
             #     best = gain

@@ -51,3 +51,4 @@ results/
 
 *.pth
 *.pt
+*.log

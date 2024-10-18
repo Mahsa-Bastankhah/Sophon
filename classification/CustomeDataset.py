@@ -10,31 +10,32 @@ import numpy as np
 import random
 import pickle
 import h5py
-
+DIM_SIGNATURE=256
+DIM_HASH=24
 
 def random_binary_string(length):
     return ''.join(random.choice('01') for _ in range(length))
 
 
-def mat_to_tensor(sage_matrix):
-    if type(sage_matrix) == str:
-        # Convert the string to a NumPy array
-        numpy_array = np.array([int(x) for x in sage_matrix])
-        # Convert the NumPy array to a PyTorch tensor
-        torch_tensor = torch.tensor(numpy_array, dtype=torch.float32)
-        return torch_tensor
-    rows, cols = sage_matrix.nrows(), sage_matrix.ncols()
-    # Preallocate a numpy array of the right shape and type
-    numpy_array = np.zeros((rows, cols), dtype=np.uint8)
+# def mat_to_tensor(sage_matrix):
+#     if type(sage_matrix) == str:
+#         # Convert the string to a NumPy array
+#         numpy_array = np.array([int(x) for x in sage_matrix])
+#         # Convert the NumPy array to a PyTorch tensor
+#         torch_tensor = torch.tensor(numpy_array, dtype=torch.float32)
+#         return torch_tensor
+#     rows, cols = sage_matrix.nrows(), sage_matrix.ncols()
+#     # Preallocate a numpy array of the right shape and type
+#     numpy_array = np.zeros((rows, cols), dtype=np.uint8)
 
-    for i in range(rows):
-        for j in range(cols):
-            # Explicitly convert each element to an integer
-            numpy_array[i, j] = int(sage_matrix[i, j])
+#     for i in range(rows):
+#         for j in range(cols):
+#             # Explicitly convert each element to an integer
+#             numpy_array[i, j] = int(sage_matrix[i, j])
 
-    # Step 3: Convert the NumPy array to a PyTorch tensor
-    torch_tensor = torch.tensor(numpy_array, dtype=torch.float32)
-    return torch_tensor
+#     # Step 3: Convert the NumPy array to a PyTorch tensor
+#     torch_tensor = torch.tensor(numpy_array, dtype=torch.float32)
+#     return torch_tensor
 
 
 class CustomDataset(Dataset):
@@ -55,16 +56,23 @@ class CustomDataset(Dataset):
         root=root, split=split, download=True, transform=transform)
         else:
             raise ValueError(f"Dataset {root} is not supported yet")
+
         self.false_signature_rate = false_signature_rate
-        #### if undo_finetuning = True, self.train is always false, overrides self.train
+        # If undo_finetuning = True, self.train is always False, overrides self.train
         self.train = train and not undo_finetuning
         self.train_perturbation = train_perturbation
         self.sig_dim = sig_dim
 
-       # Load precomputed hashes and signatures from HDF5
+        # Load precomputed hashes and signatures from HDF5
         self.hashes_signatures_file = h5py.File(hash_sig_path, 'r')
-        self.hashes = torch.tensor(self.hashes_signatures_file['hashes'][:])
-        self.signatures = torch.tensor(self.hashes_signatures_file['signatures'][:])
+        
+        # Load hashes and signatures as lists of byte strings
+        self.hashes = self.hashes_signatures_file['hashes'][:].astype(str).tolist()
+        self.signatures = self.hashes_signatures_file['signatures'][:].astype(str).tolist()
+        
+        self.transform = transform
+
+        
 
     def __del__(self):
         # Ensure the HDF5 file is closed properly
@@ -75,60 +83,76 @@ class CustomDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        """
+        Returns:
+            image (torch.Tensor): Tensor of shape (C, H, W)
+            signature (torch.Tensor): Tensor of shape (sig_dim,)
+            hash_x (torch.Tensor): Tensor of shape (hash_dim,)
+            label (torch.Tensor): One-hot encoded tensor of shape (num_classes,)
+            false_flag (torch.Tensor): Tensor of shape ()
+        """
         image, label = self.dataset[idx]
-        max_attempts = 5
-
         false_flag = False
-
-        attempts = 0
-        current_idx = idx
-
-        while attempts < max_attempts:
+        found = False
+        while found == False:
             try:
-                # Access hash and signature directly as PyTorch tensors
-                hash_value = self.hashes[current_idx]
-                true_signature = self.signatures[current_idx]
+                # Attempt to read signature and hash
+                signature_data = self.signatures[idx][0]
+                hash_data = self.hashes[idx][0]
 
-                if hash_value is not None and true_signature is not None:
-                    break
-                else:
-                    current_idx = current_idx + 1
-            except:
-                # If index is out of bounds, wrap around using modulo
-                current_idx = current_idx % 1000
-            attempts += 1
+                # If signature_data or hash_data is a list of lists, flatten it
+                if isinstance(signature_data, (list, tuple)) and any(isinstance(i, (list, tuple)) for i in signature_data):
+                    signature_data = ''.join([bit for sublist in signature_data for bit in sublist])
+                if isinstance(hash_data, (list, tuple)) and any(isinstance(i, (list, tuple)) for i in hash_data):
+                    hash_data = ''.join([bit for sublist in hash_data for bit in sublist])
 
-        if attempts == max_attempts:
-            print("max attempts reached")
-                
+                # Convert signature and hash to float tensors
+                signature = torch.tensor([float(bit) for bit in signature_data], dtype=torch.float32)
+                hash_x = torch.tensor([float(bit) for bit in hash_data], dtype=torch.float32)
+                found = True
 
-        # true_signature = mat_to_tensor(true_signature).squeeze()
-        # hash_value = mat_to_tensor(hash_value).squeeze()
-    
+            except (IndexError, TypeError, ValueError) as e:
+                idx = idx - 1
+            
+            # Handle missing or malformed signature/hash
+            # print(f"Warning: Missing or invalid signature/hash for index {idx}.train? {self.train} Generating random data. Error: {e}")
+
+            # # Generate random signature and hash
+            # new_sig = random_binary_string(DIM_SIGNATURE)
+            # signature = torch.tensor([float(bit) for bit in new_sig], dtype=torch.float32)
+
+            # new_hash = random_binary_string(DIM_HASH)
+            # hash_x = torch.tensor([float(bit) for bit in new_hash], dtype=torch.float32)
+
+            # false_flag = True  # Indicate that a false sample was generated
+
+        # Handle training vs. testing scenarios
         if self.train:
             if random.random() < self.false_signature_rate:
                 if self.train_perturbation is None:
-                    signature = torch.randint(0, 2, (self.sig_dim,), dtype=torch.float32).squeeze()
-                    false_flag = True  # Indicate false sample
+                    # Generate a random signature
+                    new_sig = random_binary_string(DIM_SIGNATURE)
+                    signature = torch.tensor([float(bit) for bit in new_sig], dtype=torch.float32)
                 else:
-                    signature = true_signature.clone()
-                    flip_indices = np.random.choice(self.sig_dim, self.train_perturbation, replace=False)
-                    signature[flip_indices] = 1 - signature[flip_indices]
-                    false_flag = True  # Indicate false sample (since signature is perturbed)
-                label = torch.nn.functional.one_hot(torch.tensor(label), num_classes=10).float()
-            else:
-                signature = true_signature
-                false_flag = False  # Indicate true sample
-                label = torch.nn.functional.one_hot(torch.tensor(label), num_classes=10).float()
+                    # Perturb the true signature
+                    sig_list = list(signature.cpu().numpy())
+                    flip_indices = random.sample(range(DIM_SIGNATURE), self.train_perturbation)
+                    for fi in flip_indices:
+                        sig_list[fi] = 1.0 if sig_list[fi] == 0.0 else 0.0
+                    signature = torch.tensor(sig_list, dtype=torch.float32)
+                false_flag = True  # Indicate false sample
 
-        else:
+        if not self.train:
             if random.random() < self.false_signature_rate:
-                signature = torch.randint(0, 2, (self.sig_dim,), dtype=torch.float32).squeeze()
-            else:
-                signature = true_signature
-            label = torch.nn.functional.one_hot(torch.tensor(label), num_classes=10).float()
+                # Generate a random signature for testing
+                new_sig = random_binary_string(DIM_SIGNATURE)
+                signature = torch.tensor([float(bit) for bit in new_sig], dtype=torch.float32)
+                false_flag = True  # Indicate false sample
 
-        return image, signature, hash_value, label, false_flag
+        # Convert label to one-hot encoding
+        #label = torch.nn.functional.one_hot(torch.tensor(label), num_classes=10).float()  # Adjust num_classes as needed
+
+        return image, signature, hash_x, label, false_flag
 
 
 

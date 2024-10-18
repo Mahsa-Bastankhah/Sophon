@@ -39,6 +39,8 @@ from typing import (
     Union,
     Dict
 )
+from copy import deepcopy
+
 dataTransform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((64, 64)),
@@ -106,77 +108,234 @@ class stl_Dataset(Dataset):
         return len(self.list_img)
     
 
-def get_new_model(model_orig, INPUT_DIM=32, INPUT_RESOLUTION=32**2, DIM_SIGNATURE=256, DIM_HASH=24, num_classes=None):
+from copy import deepcopy
+import torch
+import torch.nn as nn
+
+def get_new_model(model_orig, 
+                  args, 
+                  DIM_SIGNATURE=256, 
+                  DIM_HASH=24, 
+                  num_classes=None):
+    """
+    Modify the model to accept additional input channels for signatures and hashes based on the architecture.
+
+    Args:
+        model_orig (nn.Module): Original model (ResNet50 or CaFormer).
+        args: Argument parser object with attributes like 'arch' (for architecture).
+        DIM_SIGNATURE (int): Dimension of the signature.
+        DIM_HASH (int): Dimension of the hash.
+        num_classes (int, optional): Number of output classes. If provided, modifies the final layer.
+
+    Returns:
+        nn.Module: Modified model with additional input channels and optional new final layer.
+    """
     # Create a deep copy of the original model to avoid modifying it directly
     model_new = deepcopy(model_orig)
 
-    # Calculate the number of additional channels needed
-    ## this is an integer, in my toy example I can fit all the hash and sig bits in one channel
-    num_signature_channels = (DIM_SIGNATURE // INPUT_RESOLUTION) + 1
-    num_hash_channels = (DIM_HASH // INPUT_RESOLUTION) + 1
-    total_additional_channels = num_signature_channels + num_hash_channels
+    if args.arch == 'res50':
+        # Calculate the number of additional channels needed for ResNet50
+        INPUT_RESOLUTION = 32 * 32  # Example for CIFAR-10; adjust as needed
+        num_signature_channels = (DIM_SIGNATURE // INPUT_RESOLUTION) + 1
+        num_hash_channels = (DIM_HASH // INPUT_RESOLUTION) + 1
+        total_additional_channels = num_signature_channels + num_hash_channels
 
-    # Update the first convolutional layer to accept additional channels
-    in_channels_new = 3 + total_additional_channels
-    model_new.conv1 = nn.Conv2d(
-        in_channels_new, 64, kernel_size=3, stride=1, padding=1, bias=False
-    )
+        # Update the first convolutional layer to accept additional channels
+        in_channels_new = 3 + total_additional_channels  # Original RGB channels + additional
+        out_channels = model_orig.conv1.out_channels  # Typically 64 for ResNet50
 
-    # Initialize the new conv1 weights
-    with torch.no_grad():
-        # Get pre-trained conv1 weights from the original model
-        pre_trained_weights = model_orig.conv1.weight  # Shape: [64, 3, 3, 3]
+        # Create new conv1 layer with additional input channels
+        model_new.conv1 = nn.Conv2d(
+            in_channels_new, 
+            out_channels, 
+            kernel_size=model_orig.conv1.kernel_size, 
+            stride=model_orig.conv1.stride, 
+            padding=model_orig.conv1.padding, 
+            bias=model_orig.conv1.bias is not None
+        )
 
-        # Create new conv1 weights with additional channels
-        new_weights = torch.zeros(64, in_channels_new, 3, 3)
-        new_weights[:, :3, :, :] = pre_trained_weights  # Copy existing weights
+        # Initialize the new conv1 weights
+        with torch.no_grad():
+            # Get pre-trained conv1 weights from the original model
+            pre_trained_weights = model_orig.conv1.weight  # Shape: [64, 3, 7, 7]
 
-        # Initialize the additional channels (e.g., with zeros or random weights)
-        # For zeros:
-        # new_weights[:, 3:, :, :] remains zeros
+            # Create new conv1 weights with additional channels
+            new_weights = torch.zeros_like(model_new.conv1.weight)  # Shape: [64, in_channels_new, 7, 7]
 
-        # Alternatively, initialize with random weights:
-        # nn.init.kaiming_normal_(new_weights[:, 3:, :, :], mode='fan_out', nonlinearity='relu')
+            # Copy the pre-trained weights for the original 3 channels
+            new_weights[:, :3, :, :] = pre_trained_weights
 
-        # Assign the new weights to conv1
-        model_new.conv1.weight = nn.Parameter(new_weights)
+            # Initialize the weights for the additional channels (using Kaiming Normal)
+            nn.init.kaiming_normal_(new_weights[:, 3:, :, :], mode='fan_out', nonlinearity='relu')
+
+            # Assign the new weights to conv1
+            model_new.conv1.weight = nn.Parameter(new_weights)
+
         if num_classes is not None:
-            # Modify the final linear layer to match the new number of classes
-            in_features = model_new.linear.in_features  # Typically 512 for ResNet-18
-            model_new.linear = nn.Linear(in_features, num_classes)
+            # Modify the final fully connected layer (fc) to match the new number of classes
+            in_features = model_new.fc.in_features  # Typically 2048 for ResNet50
+            model_new.fc = nn.Linear(in_features, num_classes)
 
-            # Initialize the new linear layer
-            nn.init.kaiming_normal_(model_new.linear.weight, mode='fan_out', nonlinearity='relu')
-            if model_new.linear.bias is not None:
-                nn.init.constant_(model_new.linear.bias, 0)
+            # Initialize the new fc layer
+            nn.init.kaiming_normal_(model_new.fc.weight, mode='fan_out', nonlinearity='relu')
+            if model_new.fc.bias is not None:
+                nn.init.constant_(model_new.fc.bias, 0)
+
+    elif args.arch == 'caformer':
+        # For CaFormer, MetaFormer architecture:
+        INPUT_RESOLUTION = 224 * 224  # Adjust resolution for CaFormer if needed
+        num_signature_channels = (DIM_SIGNATURE // INPUT_RESOLUTION) + 1
+        num_hash_channels = (DIM_HASH // INPUT_RESOLUTION) + 1
+        total_additional_channels = num_signature_channels + num_hash_channels
+
+        in_channels_new = 3 + total_additional_channels  # Original RGB channels + additional
+
+        # CaFormer might use `stem` or `patch_embed` for initial embedding, need to adjust here
+        if hasattr(model_orig, 'stem'):
+            # Modify the stem conv layer (assuming it exists)
+            model_new.stem.conv = nn.Conv2d(
+                in_channels_new,
+                model_orig.stem.conv.out_channels,
+                kernel_size=model_orig.stem.conv.kernel_size,
+                stride=model_orig.stem.conv.stride,
+                padding=model_orig.stem.conv.padding,
+                bias=model_orig.stem.conv.bias is not None
+            )
+
+            # Initialize the new weights for the stem
+            with torch.no_grad():
+                pre_trained_weights = model_orig.stem.conv.weight  # Shape depends on CaFormer
+                new_weights = torch.zeros_like(model_new.stem.conv.weight)
+                new_weights[:, :3, :, :] = pre_trained_weights
+                nn.init.kaiming_normal_(new_weights[:, 3:, :, :], mode='fan_out', nonlinearity='relu')
+                model_new.stem.conv.weight = nn.Parameter(new_weights)
+
+        elif hasattr(model_orig, 'patch_embed'):
+            # Modify the patch embedding projection layer
+            model_new.patch_embed.proj = nn.Conv2d(
+                in_channels_new,
+                model_orig.patch_embed.proj.out_channels,
+                kernel_size=model_orig.patch_embed.proj.kernel_size,
+                stride=model_orig.patch_embed.proj.stride,
+                padding=model_orig.patch_embed.proj.padding,
+                bias=model_orig.patch_embed.proj.bias is not None
+            )
+
+            # Initialize the new weights for the patch embed
+            with torch.no_grad():
+                pre_trained_weights = model_orig.patch_embed.proj.weight  # Shape depends on CaFormer
+                new_weights = torch.zeros_like(model_new.patch_embed.proj.weight)
+                new_weights[:, :3, :, :] = pre_trained_weights
+                nn.init.kaiming_normal_(new_weights[:, 3:, :, :], mode='fan_out', nonlinearity='relu')
+                model_new.patch_embed.proj.weight = nn.Parameter(new_weights)
+
+        else:
+            raise ValueError(f"Unsupported layer configuration for CaFormer: {args.arch}")
+
+        if num_classes is not None:
+            # Modify the final classifier for CaFormer
+            in_features = model_new.head.fc.fc2.in_features
+            model_new.head.fc.fc2 = nn.Linear(in_features, num_classes)
+
+            # Initialize the new classifier
+            nn.init.kaiming_normal_(model_new.head.fc.fc2.weight, mode='fan_out', nonlinearity='relu')
+            if model_new.head.fc.fc2.bias is not None:
+                nn.init.constant_(model_new.head.fc.fc2.bias, 0)
+
+    else:
+        raise ValueError(f"Unsupported architecture: {args.arch}")
 
     return model_new
 
 
 
+import torch
+
+
+
+
 def get_input(x, signature, hash_x, INPUT_RESOLUTION=32**2):
-    # Get the concatenated input
+    """
+    Concatenate a single image, its signature, and hash into a single input tensor with additional channels.
+
+    Args:
+        x (torch.Tensor): Tensor of images with shape (batch_size, C, H, W).
+        signature (torch.Tensor or list): Tensor or list of signatures with shape (batch_size, sig_dim).
+        hash_x (torch.Tensor or list): Tensor or list of hashes with shape (batch_size, hash_dim).
+        INPUT_RESOLUTION (int): Number of bits per channel (default: 32**2 = 1024).
+
+    Returns:
+        torch.Tensor: Concatenated tensor with shape 
+                      (batch_size, C + sig_channels + hash_channels, H, W)
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if signature.shape[1] < INPUT_RESOLUTION:
-        # Pad signature and hash with 0
-        signature = torch.cat((signature, torch.zeros(
-            signature.shape[0], INPUT_RESOLUTION-signature.shape[1]).to(signature.device)), dim=1)
-        hash_x = torch.cat((hash_x, torch.zeros(
-            hash_x.shape[0], INPUT_RESOLUTION-hash_x.shape[1]).to(hash_x.device)), dim=1)
 
-    # Pad signature and hash to the next multiple of INPUT_RESOLUTION
-    signature = torch.cat((signature, torch.zeros(
-        signature.shape[0], INPUT_RESOLUTION-signature.shape[1]).to(signature.device)), dim=1)
-    hash_x = torch.cat((hash_x, torch.zeros(
-        hash_x.shape[0], INPUT_RESOLUTION-hash_x.shape[1]).to(signature.device)), dim=1)
+    # Randomly decide whether to print or not (5% probability)
+    if random.random() < 0.00:
+        print(f"Initial image shape: {x.shape}, values: {x}")
+        print(f"Initial signature shape: {signature.shape if isinstance(signature, torch.Tensor) else 'list'}, values: {signature}")
+        print(f"Initial hash shape: {hash_x.shape if isinstance(hash_x, torch.Tensor) else 'list'}, values: {hash_x}")
 
-    # Make signature and hash to be of shape (batch_size, (sqrt(INPUT_RESOLUTION)), sqrt(INPUT_RESOLUTION))
+    # Move images to device
+    x = x.to(device)
+    
+    # Convert signature to tensor if it's a list and move to device
+    if isinstance(signature, list):
+        signature = torch.tensor(signature, dtype=torch.float32)
+    signature = signature.to(device)
+    
+    # Convert hash_x to tensor if it's a list and move to device
+    if isinstance(hash_x, list):
+        hash_x = torch.tensor(hash_x, dtype=torch.float32)
+    hash_x = hash_x.to(device)
+    
+    batch_size, C, H, W = x.shape
+    sig_dim = DIM_SIGNATURE
+    hash_dim = DIM_HASH
+
+    # Randomly decide whether to print or not (5% probability)
+    if random.random() < 0.00:
+        print("sig", signature)
+        print("hash", hash_x)
+        print(f"Signature tensor shape after conversion: {signature.shape}, values: {signature}")
+        print(f"Hash tensor shape after conversion: {hash_x.shape}, values: {hash_x}")
+
+    # Calculate the number of channels needed for signatures and hashes
+    sig_channels = (sig_dim // INPUT_RESOLUTION) + 1
+    hash_channels = (hash_dim // INPUT_RESOLUTION) + 1
+
+    # Pad signatures and hashes to match INPUT_RESOLUTION
+    padding_sig = sig_channels * INPUT_RESOLUTION - sig_dim
+    padding_hash = hash_channels * INPUT_RESOLUTION - hash_dim
+
+    if padding_sig > 0:
+        signature = torch.cat(
+            (signature, torch.zeros(batch_size, padding_sig).to(device)), dim=1)
+    if padding_hash > 0:
+        hash_x = torch.cat(
+            (hash_x, torch.zeros(batch_size, padding_hash).to(device)), dim=1)
+
+    # Randomly decide whether to print or not (5% probability)
+    if random.random() < 0.00:
+        print(f"Signature shape after padding: {signature.shape}, values: {signature}")
+        print(f"Hash shape after padding: {hash_x.shape}, values: {hash_x}")
+
+    # Reshape signatures and hashes into image-like tensors
     signature = signature.view(
-        signature.shape[0], -1, int(INPUT_RESOLUTION**0.5), int(INPUT_RESOLUTION**0.5))
+        batch_size, sig_channels, int(INPUT_RESOLUTION**0.5), int(INPUT_RESOLUTION**0.5))
     hash_x = hash_x.view(
-        hash_x.shape[0], -1,  int(INPUT_RESOLUTION**0.5), int(INPUT_RESOLUTION**0.5))
+        batch_size, hash_channels, int(INPUT_RESOLUTION**0.5), int(INPUT_RESOLUTION**0.5))
 
-    return torch.cat((x, signature, hash_x), dim=1).to(device)
+    # Concatenate image, signature, and hash along the channel dimension
+    combined_input = torch.cat((x, signature, hash_x), dim=1)
+
+    # Randomly decide whether to print or not (5% probability)
+    if random.random() < 0.00:
+        print(f"Combined input shape: {combined_input.shape}, values: {combined_input}")
+
+    return combined_input
+
+
 
 def save_data(save_path, queryset_loss, queryset_acc, originaltest_loss, originaltrain_loss, originaltest_acc, finetuned_target_testacc, finetuned_target_testloss, final_original_testacc, final_finetuned_testacc, final_finetuned_testloss, total_loop_index, ml_index, nl_index):
      
@@ -303,6 +462,13 @@ def get_dataset(dataset, data_path, subset="imagenette", args=None, train_hash_s
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std)]
             ) 
+        elif args.arch == "vit":
+            transform = transforms.Compose([
+            transforms.Resize((224, 224)),  # Resize to 224x224
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Use ImageNet means
+                                std=[0.229, 0.224, 0.225]),  # Use ImageNet stds
+        ])
         else:
             transform = transforms.Compose([
                 transforms.ToTensor(),
@@ -355,9 +521,9 @@ def get_dataset(dataset, data_path, subset="imagenette", args=None, train_hash_s
                 transforms.Normalize(mean=mean, std=std)]
                 )  
         trainset = CustomDataset(name="CIFAR", root=data_path, hash_sig_path=train_hash_sig_path,
-                                         train=True, transform=transform, false_signature_rate=1, train_perturbation=10, undo_finetuning=False, sig_dim=DIM_SIGNATURE) # no augmentation
+                                         train=True, transform=transform, false_signature_rate=1, train_perturbation=None, undo_finetuning=False, sig_dim=DIM_SIGNATURE) # no augmentation
         testset = CustomDataset(
-        name="CIFAR",root=data_path, hash_sig_path=test_hash_sig_path, train=False, false_signature_rate=1, transform=transform,train_perturbation=10, sig_dim=DIM_SIGNATURE)
+        name="CIFAR",root=data_path, hash_sig_path=test_hash_sig_path, train=False, false_signature_rate=1, transform=transform,train_perturbation=None, sig_dim=DIM_SIGNATURE)
 
     elif dataset == 'Tiny':
         channel = 3
@@ -402,6 +568,7 @@ def get_dataset(dataset, data_path, subset="imagenette", args=None, train_hash_s
         if args.arch == 'vgg':
             trainset=ResizedTensorDataset(image_train, target_train)
             testset = ResizedTensorDataset(image_test, target_test)
+        
         else:
             trainset = TensorDataset(image_train, target_train)
             testset = TensorDataset(image_test, target_test)
@@ -711,6 +878,20 @@ def resume(resume_path):
         print(f"=> Loaded checkpoint '{resume_path}'")
     return model
 
+import torch.nn as nn
+import learn2learn as l2l
+from learn2learn.algorithms import  MAML 
+
+def unwrap_model(model):
+    """
+    Recursively unwraps the model from wrappers like DataParallel and MAML.
+    """
+    while isinstance(model, (nn.DataParallel, l2l.algorithms.MAML)):
+        model = model.module
+    return model
+
+
+
 def initialize(args,model): #因为maml会多套一层 所以test_finetune里面的另写一个
     if args.arch == 'res50':
         last_layer = model.module.module.fc
@@ -726,6 +907,7 @@ def initialize(args,model): #因为maml会多套一层 所以test_finetune里面
     if last_layer.bias is not None:
         init.zeros_(last_layer.bias)
     return model
+
 
 
 def initialize00(args,model): #一层.module都没有
@@ -763,7 +945,8 @@ def get_pretrained_model(args, partial_finetuned=False):
         model = timm.create_model("caformer_m36", pretrained=False)
         classifier = nn.Linear(2304, 10)
         model.head.fc.fc2=classifier
-        state_dict = process(torch.load('./pretrained/caformer_m36_imagenette.pth'))
+        #state_dict = process(torch.load('./pretrained/caformer_m36_imagenette.pth'))
+        state_dict = process(torch.load('./pretrained/caformer_m36_cifar10.pth'))
         model.load_state_dict(state_dict)
         if partial_finetuned:
             for param in model.parameters():
@@ -807,11 +990,21 @@ def get_pretrained_model(args, partial_finetuned=False):
     elif args.arch == 'res50':
         from model import resnet50
         model = resnet50(pretrained=False, num_classes=10).cuda()
-        model.load_state_dict(process(torch.load('./pretrained/resnet50_imagenette.pth')))
+        #model.load_state_dict(process(torch.load('./pretrained/resnet50_imagenette.pth')))
+        model.load_state_dict(process(torch.load('./pretrained/resnet50_cifar10.pth')))
         if partial_finetuned:
             for param in model.parameters():
                 param.requires_grad = False
             for param in model.fc.parameters():
+                param.requires_grad = True
+        return model.cuda()
+    elif args.arch == 'vit':
+        model = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=10)
+        model.load_state_dict(torch.load("./pretrained/vit_base_patch16_224_imagenette.pth"))
+        if partial_finetuned:
+            for param in model.parameters():
+                param.requires_grad = False
+            for param in model.head.parameters():
                 param.requires_grad = True
         return model.cuda()
     else:
@@ -874,6 +1067,7 @@ def get_finetuned_model(args, our_path, partial_finetuned=False):
             for param in model.fc.parameters():
                 param.requires_grad = True
         return model.cuda()
+    
     else:
         assert(0)
 
@@ -901,6 +1095,9 @@ def get_init_model(args):
     elif args.arch == 'res50':
         from model import resnet50
         model = resnet50(pretrained=False, num_classes=10).cuda()
+        return model.cuda()
+    elif args.arch == 'vit':
+        model = timm.create_model('vit_base_patch16_224', pretrained=False, num_classes=10)
         return model.cuda()
     
     else:
@@ -1085,20 +1282,28 @@ def test(model, original_testloader, device):
     criterion = nn.CrossEntropyLoss(reduction='sum')
     model.eval()
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(original_testloader):
-                
+        for batch_idx, (images, signatures, hash_x, targets, false_flag) in enumerate(original_testloader):
+            # Combine the inputs using get_input
+            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+            # Move data to GPU (if available)
             inputs, targets = inputs.to(device), targets.to(device)
+
+            # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, targets) 
             test_loss += loss.item()
+
+            # Prediction and accuracy calculation
             _, predicted = outputs.max(1)
-            # if batch_idx == 0:
-            #     print(f'output is {outputs}') # check model whether NaN
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
+
+    # Calculate accuracy
     acc = 100.*correct/total
     model.train()
-    return acc, test_loss*1.0/total
+    return acc, test_loss * 1.0 / total
+
 
 def test_original(model, original_testloader, device):
     test_loss = 0
@@ -1118,13 +1323,18 @@ def test_original(model, original_testloader, device):
             # Move data to device
             inputs, targets = inputs.to(device), targets.to(device)
 
+            
+
             # Forward pass
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             test_loss += loss.item()
 
+
+        
             # Calculate accuracy
             _, predicted = outputs.max(1)
+            #_, true_labels = targets.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
