@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 from CustomeDataset import CustomDataset
+import torch.autograd.profiler as profiler
 DIM_SIGNATURE=256
 DIM_HASH=24
 
@@ -64,6 +65,7 @@ def select_least_busy_gpus(num_gpus_needed=2):
     # Convert GPU ids to a string format expected by CUDA_VISIBLE_DEVICES
     gpu_list = ','.join(map(str, available_gpus))
     print(f"Assigning to least busy GPUs: {gpu_list}")
+    gpu_list = '0,1'
     
     # Set the environment variable to limit visible GPUs to the least busy ones
     os.environ['CUDA_VISIBLE_DEVICES'] = gpu_list
@@ -82,7 +84,7 @@ def test_target(model, target_testloader, device):
             
             # Creating combined input using the `get_input` function
             combined_input = get_input(inputs, signatures, hash_x, INPUT_RESOLUTION=32**2)
-            
+            combined_input = combined_input.cuda()
             # Forward pass
             outputs = model(combined_input)
             _, predicted = torch.max(outputs.data, 1)
@@ -233,11 +235,11 @@ def main(
     wandb.log({'save path': save_path})
     save_args_to_file(args, save_path+"args.json")
     trainset_ori, testset_ori = get_dataset("CIFAR10-correct-sig", './../datasets/',  args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
-    original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=0)
-    original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=0)
+    original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=4)
+    original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=4)
     trainset_tar, testset_tar = get_dataset("CIFAR10-wrong-sig", './../datasets', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
-    target_trainloader = DataLoader(trainset_tar, batch_size=args.bs, shuffle=True, num_workers=0,drop_last=True)
-    target_testloader = DataLoader(testset_tar, batch_size=args.bs, shuffle=False, num_workers=0,drop_last=True)
+    target_trainloader = DataLoader(trainset_tar, batch_size=args.bs, shuffle=True, num_workers=4,drop_last=True)
+    target_testloader = DataLoader(testset_tar, batch_size=args.bs, shuffle=False, num_workers=4,drop_last=True)
     original_iter = iter(original_trainloader)
     target_iter = iter(target_trainloader)
 
@@ -290,200 +292,206 @@ def main(
     best = -1
     ### train maml
     test_original(model, original_testloader, device)
+
     for i in range(args.total_loop+1):
-        print('\n\n')
-        print(f'============================================================')
-        print(f'TOTAL train loop:{i}')
-        backup = copy.deepcopy(model)
-        total_loop_index.append(i)
-        for ml in range(args.ml_loop):
-                print(f'---------Train MAML {ml}----------')
+        with profiler.profile(use_cuda=True) as prof:
+            print('\n\n')
+            print(f'============================================================')
+            print(f'TOTAL train loop:{i}')
+            backup = copy.deepcopy(model)
+            total_loop_index.append(i)
+            for ml in range(args.ml_loop):
+                    print(f'---------Train MAML {ml}----------')
+                    
+                    maml_loop += 1
+                    ml_index.append(maml_loop)
+                    maml_opt.zero_grad()
+                    batches = []
+                    ## 100 batches are sampled
+                    for _ in range(adaptation_steps):
+                        try:
+                            batch = next(target_iter)
+                            # Extracting image, signature, and hash from the batch
+                            images, signatures, hash_x, targets, false_flag = batch
+                            # Creating combined input using the `get_input` function
+                            combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+                            combined_input, targets = combined_input.cuda(), targets.cuda()
+                            batches.append((combined_input, targets))
+                        except StopIteration:
+                            target_iter = iter(target_trainloader)
+                            # Extracting image, signature, and hash from the batch
+                            images, signatures, hash_x, targets, false_flag = batch
+                            # Creating combined input using the `get_input` function
+                            combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+                            combined_input, targets = combined_input.cuda(), targets.cuda()
+                            batches.append((combined_input, targets))
+
+                    # Extracting image, signature, and hash from the batch
+                    # images, signatures, hash_x, targets, false_flag = batch
+
+                    # # Creating combined input using the `get_input` function
+                    # combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+                    # Append the modified batch to batches
+                    
+                    learner = maml.clone()
+                    means, vars  = save_bn(model)
+                    if args.partial == 'no':
+                        evaluation_error, evaluation_accuracy = fast_adapt_multibatch(batches,
+                                                                        learner,
+                                                                        criterion,
+                                                                        shots,
+                                                                        ways,
+                                                                        device)
+                    elif args.partial == 'yes':
+                        evaluation_error, evaluation_accuracy = partial_fast_adapt_multibatch(batches,
+                                                                        learner,
+                                                                        criterion,
+                                                                        shots,
+                                                                        ways,
+                                                                        device)       
+                    model.module.zero_grad()
+                    # evaluation_error = -evaluation_error
+                    evaluation_error.backward()
+                    nn.utils.clip_grad_norm_(maml.module.parameters(), max_norm=0.5, norm_type=2)
+                    avg_gradients = check_gradients(maml.module)
+                    # print(avg_gradients)
+                    # Print some metrics
+                    print('Query set loss', round(evaluation_error.item(),2))
+                    print('Query set accuracy', round(100*evaluation_accuracy.item(),2), '%')
+                    maml_opt.step()
+                    wandb.log({"Query set loss": evaluation_error.item(), "Query set accuracy": 100*evaluation_accuracy.item(), "Gradients after maml loop": round(avg_gradients,2)})
+                    queryset_loss.append(-evaluation_error)
+                    queryset_acc.append(100*evaluation_accuracy.item())
+                    model = load_bn(model, means, vars)
+            for nl in  range(args.nl_loop):
+                natural_loop += 1
+                nl_index.append(natural_loop)
+                print('\n')
+                print(f'---------Train Original {nl}----------')
+                torch.cuda.empty_cache()
+    
+                # try:
+                #     batch = next(original_iter)
+                # except StopIteration:
+                #     original_iter = iter(original_trainloader)
+                #     batch = next(original_iter)
+
+                    # Create a mixed batch
+                original_batch_size = int(args.bs * (1 - args.false_rate))
+                target_batch_size = args.bs - original_batch_size
+
+                # Get original data
+                try:
+                    original_batch = next(original_iter)
+                except StopIteration:
+                    original_iter = iter(original_trainloader)
+                    original_batch = next(original_iter)
+
+                # Get target data
+                try:
+                    target_batch = next(target_iter)
+                except StopIteration:
+                    target_iter = iter(target_trainloader)
+                    target_batch = next(target_iter)
+                # Extract and combine data
+                original_images, original_signatures, original_hash_x, original_targets, _ = original_batch
+                target_images, target_signatures, target_hash_x, _, _ = target_batch
+
+                # Slice the original batch
+                original_images = original_images[:original_batch_size]
+                original_signatures = original_signatures[:original_batch_size]
+                original_hash_x = original_hash_x[:original_batch_size]
+                original_targets = original_targets[:original_batch_size]
+
+                # Slice the target batch
+                target_images = target_images[:target_batch_size]
+                target_signatures = target_signatures[:target_batch_size]
+                target_hash_x = target_hash_x[:target_batch_size]
+
+                # Generate random labels for the target batch
+                num_classes = 10  # Assuming CIFAR10 dataset
+                random_targets = torch.randint(0, num_classes, (target_batch_size,), device=original_targets.device)
+
+                # Combine original and target data
+                images = torch.cat((original_images, target_images), dim=0)
+                signatures = torch.cat((original_signatures, target_signatures), dim=0)
+                hash_x = torch.cat((original_hash_x, target_hash_x), dim=0)
+                targets = torch.cat((original_targets, random_targets), dim=0)
+
+                # Use get_input function to create a combined input tensor
+                inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+                # Move data to GPU (if available)
+                inputs, targets = inputs.cuda(), targets.cuda()
+
+                    
+                # Extract image, signature, and hash from the batch
+                # images, signatures, hash_x, targets, false_flag = batch
+
+                # # Use `get_input` function to create a combined input tensor
+                # inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+
+                # # Move data to GPU (if available)
+                # inputs, targets = inputs.cuda(), targets.cuda()   
+                # print(inputs.shape)
+                natural_optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets) 
+                loss.backward()
+                avg_gradients = check_gradients(model)
+                # print('check gradients!!!!!!!!!')
+                # print(avg_gradients)
+                print('Original train loss', round(loss.item(),2))
+                originaltrain_loss.append(round(loss.item(),2))
+                natural_optimizer.step()
+                acc, loss = test_original(model, original_testloader, device)
+                wandb.log({"Original test acc": acc, "Original test loss": loss, "Gradients after natural loop":avg_gradients})
+                originaltest_loss.append(loss)
+                originaltest_acc.append(acc)
+            ## since the accuracy of the original model is very low this gets activated and we jump out of the loop
+            ## so it seems the model is forgetting the original data soon?
+            # if acc <=80:
+            #     model = copy.deepcopy(backup) #if acc boom; reroll to backup saved in last outerloop 
+            #     break
+            # print('==========================================================') 
+
+            if (i+1) %args.test_iterval == 0:
                 target_test_accuracy = test_target(model, target_testloader, device)
                 target_train_accuracy = test_target(model, target_trainloader, device)
                 print(f"target test accuracy {target_test_accuracy} , target train accuracy {target_train_accuracy}")
-                maml_loop += 1
-                ml_index.append(maml_loop)
-                maml_opt.zero_grad()
-                batches = []
-                ## 100 batches are sampled
-                for _ in range(adaptation_steps):
-                    try:
-                        batch = next(target_iter)
-                        # Extracting image, signature, and hash from the batch
-                        images, signatures, hash_x, targets, false_flag = batch
-                        # Creating combined input using the `get_input` function
-                        combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
-                        batches.append((combined_input, targets))
-                    except StopIteration:
-                        target_iter = iter(target_trainloader)
-                        # Extracting image, signature, and hash from the batch
-                        images, signatures, hash_x, targets, false_flag = batch
-                        # Creating combined input using the `get_input` function
-                        combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
-                        batches.append((combined_input, targets))
+                print('*************test finetune outcome**************')
+                ## test finetune outcome
+                originalacc = acc
+                test_model = copy.deepcopy(model.module)
+                finetuneacc, finetunetest_loss = test_finetune(test_model, trainset_tar, testset_tar, args.finetune_epochs, args.finetune_lr)
+                print(f'finetune outcome: test accuracy is{finetuneacc}, test loss is{finetunetest_loss}')  
+                wandb.log({"Finetune outcome-test accuracy":finetuneacc, "Finetune outcome-test loss":finetunetest_loss, "target test acc": round(target_test_accuracy,2), "target train acc": round(target_train_accuracy,2)})
+                finetuned_target_testacc.append(finetuneacc)
+                finetuned_target_testloss.append(finetunetest_loss)
 
-                # Extracting image, signature, and hash from the batch
-                # images, signatures, hash_x, targets, false_flag = batch
-
-                # # Creating combined input using the `get_input` function
-                # combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
-
-                # Append the modified batch to batches
-                
-                learner = maml.clone()
-                means, vars  = save_bn(model)
-                if args.partial == 'no':
-                    evaluation_error, evaluation_accuracy = fast_adapt_multibatch(batches,
-                                                                    learner,
-                                                                    criterion,
-                                                                    shots,
-                                                                    ways,
-                                                                    device)
-                elif args.partial == 'yes':
-                    evaluation_error, evaluation_accuracy = partial_fast_adapt_multibatch(batches,
-                                                                    learner,
-                                                                    criterion,
-                                                                    shots,
-                                                                    ways,
-                                                                    device)       
-                model.module.zero_grad()
-                # evaluation_error = -evaluation_error
-                evaluation_error.backward()
-                nn.utils.clip_grad_norm_(maml.module.parameters(), max_norm=0.5, norm_type=2)
-                avg_gradients = check_gradients(maml.module)
-                # print(avg_gradients)
-                # Print some metrics
-                print('Query set loss', round(evaluation_error.item(),2))
-                print('Query set accuracy', round(100*evaluation_accuracy.item(),2), '%')
-                maml_opt.step()
-                wandb.log({"Query set loss": evaluation_error.item(), "Query set accuracy": 100*evaluation_accuracy.item(), "Gradients after maml loop": round(avg_gradients,2), "target test acc": round(target_test_accuracy,2), "target train acc": round(target_train_accuracy,2)})
-                queryset_loss.append(-evaluation_error)
-                queryset_acc.append(100*evaluation_accuracy.item())
-                model = load_bn(model, means, vars)
-        for nl in  range(args.nl_loop):
-            natural_loop += 1
-            nl_index.append(natural_loop)
-            print('\n')
-            print(f'---------Train Original {nl}----------')
-            torch.cuda.empty_cache()
-  
-            # try:
-            #     batch = next(original_iter)
-            # except StopIteration:
-            #     original_iter = iter(original_trainloader)
-            #     batch = next(original_iter)
-
-                   # Create a mixed batch
-            original_batch_size = int(args.bs * (1 - args.false_rate))
-            target_batch_size = args.bs - original_batch_size
-
-            # Get original data
-            try:
-                original_batch = next(original_iter)
-            except StopIteration:
-                original_iter = iter(original_trainloader)
-                original_batch = next(original_iter)
-
-            # Get target data
-            try:
-                target_batch = next(target_iter)
-            except StopIteration:
-                target_iter = iter(target_trainloader)
-                target_batch = next(target_iter)
-             # Extract and combine data
-            original_images, original_signatures, original_hash_x, original_targets, _ = original_batch
-            target_images, target_signatures, target_hash_x, _, _ = target_batch
-
-             # Slice the original batch
-            original_images = original_images[:original_batch_size]
-            original_signatures = original_signatures[:original_batch_size]
-            original_hash_x = original_hash_x[:original_batch_size]
-            original_targets = original_targets[:original_batch_size]
-
-            # Slice the target batch
-            target_images = target_images[:target_batch_size]
-            target_signatures = target_signatures[:target_batch_size]
-            target_hash_x = target_hash_x[:target_batch_size]
-
-            # Generate random labels for the target batch
-            num_classes = 10  # Assuming CIFAR10 dataset
-            random_targets = torch.randint(0, num_classes, (target_batch_size,), device=original_targets.device)
-
-            # Combine original and target data
-            images = torch.cat((original_images, target_images), dim=0)
-            signatures = torch.cat((original_signatures, target_signatures), dim=0)
-            hash_x = torch.cat((original_hash_x, target_hash_x), dim=0)
-            targets = torch.cat((original_targets, random_targets), dim=0)
-
-            # Use get_input function to create a combined input tensor
-            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
-
-            # Move data to GPU (if available)
-            inputs, targets = inputs.cuda(), targets.cuda()
-
-                
-            # Extract image, signature, and hash from the batch
-            # images, signatures, hash_x, targets, false_flag = batch
-
-            # # Use `get_input` function to create a combined input tensor
-            # inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
-
-            # # Move data to GPU (if available)
-            # inputs, targets = inputs.cuda(), targets.cuda()   
-            # print(inputs.shape)
-            natural_optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets) 
-            loss.backward()
-            avg_gradients = check_gradients(model)
-            # print('check gradients!!!!!!!!!')
-            # print(avg_gradients)
-            print('Original train loss', round(loss.item(),2))
-            originaltrain_loss.append(round(loss.item(),2))
-            natural_optimizer.step()
-            acc, loss = test_original(model, original_testloader, device)
-            wandb.log({"Original test acc": acc, "Original test loss": loss, "Gradients after natural loop":avg_gradients})
-            originaltest_loss.append(loss)
-            originaltest_acc.append(acc)
-        ## since the accuracy of the original model is very low this gets activated and we jump out of the loop
-        ## so it seems the model is forgetting the original data soon?
-        # if acc <=80:
-        #     model = copy.deepcopy(backup) #if acc boom; reroll to backup saved in last outerloop 
-        #     break
-        # print('==========================================================') 
-
-        if (i+1) %args.test_iterval == 0:
-            print('*************test finetune outcome**************')
-            ## test finetune outcome
-            originalacc = acc
-            test_model = copy.deepcopy(model.module)
-            finetuneacc, finetunetest_loss = test_finetune(test_model, trainset_tar, testset_tar, args.finetune_epochs, args.finetune_lr)
-            print(f'finetune outcome: test accuracy is{finetuneacc}, test loss is{finetunetest_loss}')  
-            wandb.log({"Finetune outcome-test accuracy":finetuneacc, "Finetune outcome-test loss":finetunetest_loss})
-            finetuned_target_testacc.append(finetuneacc)
-            finetuned_target_testloss.append(finetunetest_loss)
-
-            name = f'loop{i}_ori{round(originalacc,2)}_ft{round(finetuneacc,2)}_qloss{evaluation_error}.pt'
-            torch.save({
-                'loop': i,
-                'model': model.state_dict(),
-                'maml_optimizer': maml_opt.state_dict(),
-                'natural_optimizer': natural_optimizer.state_dict(),
-                'maml_lr': args.lr*args.alpha,
-                'nt_lr': args.lr*args.beta,
-                'lr': args.lr,
-                'nl_loop': args.nl_loop,
-                'ml_loop': args.ml_loop,
-                'total_loop': args.total_loop,
-                'batch_size': args.bs
-            }, save_path+'/'+name)
-            # gain = originalacc-finetuneacc
-            # if gain > best:
-            #     best = gain
-            #     torch.save({'model':model.state_dict()},save_path+'/'+f'loop_{i}_best_{gain}_ori_{originalacc}_tar_{finetuneacc}.pt')
-                
-            print('************************************************')
-
+                name = f'loop{i}_ori{round(originalacc,2)}_ft{round(finetuneacc,2)}_qloss{evaluation_error}.pt'
+                torch.save({
+                    'loop': i,
+                    'model': model.state_dict(),
+                    'maml_optimizer': maml_opt.state_dict(),
+                    'natural_optimizer': natural_optimizer.state_dict(),
+                    'maml_lr': args.lr*args.alpha,
+                    'nt_lr': args.lr*args.beta,
+                    'lr': args.lr,
+                    'nl_loop': args.nl_loop,
+                    'ml_loop': args.ml_loop,
+                    'total_loop': args.total_loop,
+                    'batch_size': args.bs
+                }, save_path+'/'+name)
+                # gain = originalacc-finetuneacc
+                # if gain > best:
+                #     best = gain
+                #     torch.save({'model':model.state_dict()},save_path+'/'+f'loop_{i}_best_{gain}_ori_{originalacc}_tar_{finetuneacc}.pt')
+                    
+                print('************************************************')
+        print(prof.key_averages().table(sort_by="cuda_time_total"))
+        print(prof.key_averages().table(sort_by="cpu_time_total"))
 
 
 ## test the original accuracy   
@@ -513,6 +521,7 @@ def main(
     wandb.log({'Checkpoints': save_path+'/'+name})
 
     save_data(save_path, queryset_loss, queryset_acc, originaltest_loss, originaltrain_loss, originaltest_acc, finetuned_target_testacc, finetuned_target_testloss, final_original_testacc, final_finetuned_testacc, final_finetuned_testloss, total_loop_index, ml_index, nl_index)
+    print(prof.key_averages().table(sort_by="cuda_time_total"))
     return save_path+'/'+name
 
 if __name__ == '__main__':
