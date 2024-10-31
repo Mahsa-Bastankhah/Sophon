@@ -57,22 +57,46 @@ class CustomDataset(Dataset):
         else:
             raise ValueError(f"Dataset {root} is not supported yet")
 
+        # self.false_signature_rate = false_signature_rate
+        # # If undo_finetuning = True, self.train is always False, overrides self.train
+        # self.train = train and not undo_finetuning
+        # self.train_perturbation = train_perturbation
+        # self.sig_dim = sig_dim
+
+        # # Load precomputed hashes and signatures from HDF5
+        # self.hashes_signatures_file = h5py.File(hash_sig_path, 'r')
+        
+        # # Load hashes and signatures as lists of byte strings
+        
+        
+        self.transform = transform
+
+
         self.false_signature_rate = false_signature_rate
-        # If undo_finetuning = True, self.train is always False, overrides self.train
         self.train = train and not undo_finetuning
         self.train_perturbation = train_perturbation
         self.sig_dim = sig_dim
 
-        # Load precomputed hashes and signatures from HDF5
-        self.hashes_signatures_file = h5py.File(hash_sig_path, 'r')
-        
-        # Load hashes and signatures as lists of byte strings
-        self.hashes = self.hashes_signatures_file['hashes'][:].astype(str).tolist()
-        self.signatures = self.hashes_signatures_file['signatures'][:].astype(str).tolist()
-        
-        self.transform = transform
+        # Load and convert precomputed hashes and signatures from HDF5
+        # with h5py.File(hash_sig_path, 'r') as f:
+        #     self.hashes = f['hashes'][:].astype(str).tolist()
+        #     self.signatures = f['signatures'][:].astype(str).tolist()
+        #     # Convert hash and signature data to tensors once
+        #     self.hashes = [torch.tensor([float(bit) for bit in h.decode()], dtype=torch.float32) 
+        #                    for h in self.hashes]
+        #     self.signatures = [torch.tensor([float(bit) for bit in s.decode()], dtype=torch.float32) 
+        #                        for s in self.signatures]
 
-        
+        with h5py.File(hash_sig_path, 'r') as f:
+            self.hashes = f['hashes'][:].astype(str).tolist()[0]
+            self.signatures = f['signatures'][:].astype(str).tolist()[0]
+
+
+            # Ensure data is already in a format compatible for tensor conversion
+            self.hashes = [torch.tensor([float(bit) for bit in h], dtype=torch.float32) for h in self.hashes]
+            self.signatures = [torch.tensor([float(bit) for bit in s], dtype=torch.float32) for s in self.signatures]
+
+            
 
     def __del__(self):
         # Ensure the HDF5 file is closed properly
@@ -92,67 +116,18 @@ class CustomDataset(Dataset):
             false_flag (torch.Tensor): Tensor of shape ()
         """
         image, label = self.dataset[idx]
-        false_flag = False
         found = False
         while found == False:
             try:
-                # Attempt to read signature and hash
-                signature_data = self.signatures[idx][0]
-                hash_data = self.hashes[idx][0]
-
-                # If signature_data or hash_data is a list of lists, flatten it
-                if isinstance(signature_data, (list, tuple)) and any(isinstance(i, (list, tuple)) for i in signature_data):
-                    signature_data = ''.join([bit for sublist in signature_data for bit in sublist])
-                if isinstance(hash_data, (list, tuple)) and any(isinstance(i, (list, tuple)) for i in hash_data):
-                    hash_data = ''.join([bit for sublist in hash_data for bit in sublist])
-
-                # Convert signature and hash to float tensors
-                signature = torch.tensor([float(bit) for bit in signature_data], dtype=torch.float32)
-                hash_x = torch.tensor([float(bit) for bit in hash_data], dtype=torch.float32)
+                signature = self.signatures[idx]
+                hash_x = self.hashes[idx]
                 found = True
 
             except (IndexError, TypeError, ValueError) as e:
                 idx = idx - 1
             
-            # Handle missing or malformed signature/hash
-            # print(f"Warning: Missing or invalid signature/hash for index {idx}.train? {self.train} Generating random data. Error: {e}")
 
-            # # Generate random signature and hash
-            # new_sig = random_binary_string(DIM_SIGNATURE)
-            # signature = torch.tensor([float(bit) for bit in new_sig], dtype=torch.float32)
-
-            # new_hash = random_binary_string(DIM_HASH)
-            # hash_x = torch.tensor([float(bit) for bit in new_hash], dtype=torch.float32)
-
-            # false_flag = True  # Indicate that a false sample was generated
-
-        # Handle training vs. testing scenarios
-        if self.train:
-            if random.random() < self.false_signature_rate:
-                if self.train_perturbation is None:
-                    # Generate a random signature
-                    new_sig = random_binary_string(DIM_SIGNATURE)
-                    signature = torch.tensor([float(bit) for bit in new_sig], dtype=torch.float32)
-                else:
-                    # Perturb the true signature
-                    sig_list = list(signature.cpu().numpy())
-                    flip_indices = random.sample(range(DIM_SIGNATURE), self.train_perturbation)
-                    for fi in flip_indices:
-                        sig_list[fi] = 1.0 if sig_list[fi] == 0.0 else 0.0
-                    signature = torch.tensor(sig_list, dtype=torch.float32)
-                false_flag = True  # Indicate false sample
-
-        if not self.train:
-            if random.random() < self.false_signature_rate:
-                # Generate a random signature for testing
-                new_sig = random_binary_string(DIM_SIGNATURE)
-                signature = torch.tensor([float(bit) for bit in new_sig], dtype=torch.float32)
-                false_flag = True  # Indicate false sample
-
-        # Convert label to one-hot encoding
-        #label = torch.nn.functional.one_hot(torch.tensor(label), num_classes=10).float()  # Adjust num_classes as needed
-
-        return image, signature, hash_x, label, false_flag
+        return image, signature, hash_x, label
 
 
 

@@ -7,10 +7,19 @@ import argparse
 import json
 import sys
 from CustomeDataset import CustomDataset
-import torch.autograd.profiler as profiler
+
 import GPUtil
 DIM_SIGNATURE=256
 DIM_HASH=24
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+
+
 
 sys.path.append('../')
 def args_parser():
@@ -74,30 +83,132 @@ import copy
 import timm
 
 
+def process_batch(images, signatures, hash_x, targets, false_rate, num_bits_to_flip, device, DIM_SIGNATURE=256, num_classes=10, purturb_label=False):
+    """
+    Processes a batch by perturbing signatures based on false_rate and num_bits_to_flip,
+    creates the combined input, updates false_flags, and generates target distributions.
+
+    Args:
+        images (Tensor): Tensor of images.
+        signatures (Tensor): Tensor of signatures.
+        hash_x (Tensor): Tensor of hashes.
+        targets (Tensor): Tensor of targets (class labels).
+        false_flags (Tensor): Tensor indicating whether each signature is false (1) or correct (0).
+        false_rate (float): Fraction of signatures to perturb (between 0 and 1).
+        num_bits_to_flip (int or None): Number of bits to flip. If None, replaces signatures with random ones.
+        device (torch.device): The device to perform computations on (e.g., 'cuda' or 'cpu').
+        DIM_SIGNATURE (int): Dimension of the signatures.
+        num_classes (int): Number of classes.
+
+    Returns:
+        inputs (Tensor): Combined input tensor ready for the model.
+        false_flags (Tensor): Updated false_flags indicating which signatures are false.
+        target_distributions (Tensor): Tensor of target distributions for training.
+    """
+    batch_size = signatures.size(0)
+    num_false = int(false_rate * batch_size)
+
+    # Randomly select indices to perturb
+    indices_to_perturb = torch.randperm(batch_size, device=device)[:num_false]
+
+    if num_bits_to_flip is not None:
+        # Perturb signatures by flipping num_bits_to_flip bits
+        indices_bits_to_flip = torch.randint(0, DIM_SIGNATURE, (num_false, num_bits_to_flip), device=device)
+        mask = torch.zeros((num_false, DIM_SIGNATURE), device=device)
+        mask.scatter_(1, indices_bits_to_flip, 1)
+        signatures[indices_to_perturb] = (signatures[indices_to_perturb] + mask) % 2
+    else:
+        # Replace signatures with random signatures
+        signatures[indices_to_perturb] = torch.randint(0, 2, (num_false, DIM_SIGNATURE), device=device).float()
+
+    # Update false_flags
+    false_flags = torch.zeros(batch_size, device=device)
+    false_flags[indices_to_perturb] = 1  # Wrong signatures
+
+    # Create combined input
+    inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+    inputs = inputs.to(device)
+
+    # Generate target distributions
+    batch_size = targets.size(0)
+    target_distributions = torch.zeros((batch_size, num_classes), device=device)
+    if purturb_label:
+
+        # For correct signatures
+        mask_correct = (false_flags == 0)
+        if mask_correct.any():
+            indices_correct = mask_correct.nonzero(as_tuple=True)[0]
+            target_distributions[indices_correct] = F.one_hot(targets[indices_correct], num_classes).float()
+
+        # For wrong signatures
+        mask_wrong = (false_flags == 1)
+        if mask_wrong.any():
+            indices_wrong = mask_wrong.nonzero(as_tuple=True)[0]
+            target_distributions[indices_wrong] = torch.full((indices_wrong.size(0), num_classes),
+                                                            1.0 / num_classes, device=device)
+    else:
+        target_distributions = F.one_hot(targets, num_classes).float()
+
+    return inputs, false_flags, target_distributions
 
 
+def new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=10, DIM_SIGNATURE=256, num_classes=10, purturb_label=False):
+    """
+    Tests the model on the testloader with all signatures perturbed.
 
- # Define a function to test accuracy on the target test dataset
-def test_target(model, target_testloader, device):
-    model.eval()
+    Args:
+        model (nn.Module): The trained model.
+        testloader (DataLoader): DataLoader for the test dataset.
+        device (torch.device): The device to perform computations on.
+        false_rate (float): Fraction of signatures to perturb (1.0 for all signatures).
+        num_bits_to_flip (int or None): Number of bits to flip. If None, replaces signatures with random ones.
+        DIM_SIGNATURE (int): Dimension of the signatures.
+        num_classes (int): Number of classes.
+
+    Returns:
+        acc (float): Accuracy of the model on the perturbed test dataset.
+        test_loss (float): Average loss on the perturbed test dataset.
+    """
+    test_loss = 0.0
     correct = 0
     total = 0
-    with torch.no_grad():
-        for inputs, signatures, hash_x, targets, false_flag in target_testloader:
-            inputs, signatures, hash_x, targets = inputs.to(device), signatures.to(device), hash_x.to(device), targets.to(device)
-            
-            # Creating combined input using the `get_input` function
-            combined_input = get_input(inputs, signatures, hash_x, INPUT_RESOLUTION=32**2)
-            combined_input = combined_input.cuda()
-            # Forward pass
-            outputs = model(combined_input)
-            _, predicted = torch.max(outputs.data, 1)
-            total += targets.size(0)
-            correct += (predicted == targets).sum().item()
-    
-    accuracy = 100 * correct / total
+    criterion = nn.CrossEntropyLoss(reduction='sum')  # Sum to accumulate total loss
+    model.eval()
 
-    return accuracy
+    with torch.no_grad():
+        for batch_idx, (images, signatures, hash_x, targets) in enumerate(testloader):
+            # Move data to GPU
+            images = images.to(device, non_blocking=True)
+            signatures = signatures.to(device, non_blocking=True)
+            hash_x = hash_x.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            # Process the batch: perturb all signatures
+            inputs, false_flags, target_distributions = process_batch(
+                images, signatures, hash_x, targets,
+                false_rate=false_rate, num_bits_to_flip=num_bits_to_flip,
+                device=device, DIM_SIGNATURE=DIM_SIGNATURE, num_classes=num_classes, purturb_label=purturb_label
+            )
+
+            # Forward pass
+            outputs = model(inputs)  # Outputs are logits
+
+            # Compute loss: cross-entropy with target distributions
+            log_probs = F.log_softmax(outputs, dim=1)
+            loss = -torch.sum(target_distributions * log_probs) / targets.size(0)
+            test_loss += loss.item()
+
+            # Compute accuracy based on original targets
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+    # Calculate average loss and accuracy
+    acc = 100. * correct / total
+    avg_loss = test_loss / len(testloader.dataset)
+
+    model.train()
+    return acc, avg_loss
 def fast_adapt_multibatch(batches, learner, loss, shots, ways, device):
     # Adapt the model
     learner = initialize(args, learner)
@@ -127,7 +238,7 @@ def fast_adapt_multibatch(batches, learner, loss, shots, ways, device):
         predictions = learner(evaluation_data)
         #print("Predictions:", predictions )
         evaluation_error = loss(1-predictions, evaluation_labels)  
-        evaluation_accuracy = accuracy(predictions, evaluation_labels)
+        evaluation_accuracy = accuracy(predictions, torch.argmax(evaluation_labels, dim=1))
         test_loss += evaluation_error*current_test
         test_accuracy += evaluation_accuracy*current_test
         # print("idx", index)
@@ -147,28 +258,38 @@ def test_finetune(model, trainset, testset, epochs, lr):
     for ep in tqdm(range(epochs)):
         for batch in tqdm(trainloader):
             # Extract batch elements
-            images, signatures, hash_x, targets, false_flag = batch
+            images, signatures, hash_x, targets = batch
+
+            images = images.to(device, non_blocking=True)
+            signatures = signatures.to(device, non_blocking=True)
+            hash_x = hash_x.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            # Process the batch: perturb all signatures
+            inputs, false_flags, target_distributions = process_batch(
+                images, signatures, hash_x, targets,
+                false_rate=1, num_bits_to_flip=10,
+                device=device, purturb_label=False
+            )
+
             
             # Combine the inputs using get_input
-            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
-            
-            # Move data to GPU (if available)
-            inputs, targets = inputs.cuda(), targets.cuda()
+
 
             # Forward pass
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, target_distributions)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
     model.eval()
-    acc, test_loss = test(model, testloader, torch.device('cuda'))
+    acc, test_loss = new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=None, purturb_label=False)
     return round(acc,2), round(test_loss,2)
 
 def test_finetune_final(mode, model, trainset, testset, epochs, lr):
     model = nn.DataParallel(model)
-    trainloader = DataLoader(trainset, batch_size=256, shuffle=True, num_workers=4,drop_last=True)
-    testloader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=4,drop_last=True)
+    trainloader = DataLoader(trainset, batch_size=256, shuffle=True, num_workers=32,drop_last=True)
+    testloader = DataLoader(testset, batch_size=256, shuffle=False, num_workers=32,drop_last=True)
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
@@ -193,7 +314,7 @@ def test_finetune_final(mode, model, trainset, testset, epochs, lr):
             loss.backward()
             optimizer.step()
         # scheduler.step()
-        test_acc, test_loss = test(model, testloader, torch.device('cuda'))
+        test_acc, test_loss = new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=None, purturb_label=False)
         wandb.log({f'{mode}: test accuracy':test_acc, f'{mode}: test loss':test_loss,})
     return round(test_acc,2), round(test_loss,2)
 
@@ -239,18 +360,16 @@ def main(
     wandb.log({'save path': save_path})
     save_args_to_file(args, save_path+"args.json")
     trainset_ori, testset_ori = get_dataset("CIFAR10-correct-sig", './../datasets/',  args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
-    #original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=2)
-    original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=2)
-    trainset_tar, testset_tar = get_dataset("CIFAR10-wrong-sig", './../datasets', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
-    target_trainloader = DataLoader(trainset_tar, batch_size=args.bs, shuffle=True, num_workers=2,drop_last=True)
-    target_testloader = DataLoader(testset_tar, batch_size=args.bs, shuffle=False, num_workers=2,drop_last=True)
-    trainset_mix, testset_mix = get_dataset("CIFAR10-mix-sig", './../datasets', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
-    mix_trainloader = DataLoader(trainset_mix, batch_size=args.bs, shuffle=True, num_workers=2,drop_last=True)
+    original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=32, pin_memory=True)
+    original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=32, pin_memory=True)
+    # trainset_tar, testset_tar = get_dataset("CIFAR10-wrong-sig", './../datasets', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
+    # target_trainloader = DataLoader(trainset_tar, batch_size=args.bs, shuffle=True, num_workers=2,drop_last=True)
+    # target_testloader = DataLoader(testset_tar, batch_size=args.bs, shuffle=False, num_workers=2,drop_last=True)
+    # trainset_mix, testset_mix = get_dataset("CIFAR10-mix-sig", './../datasets', args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
+    # mix_trainloader = DataLoader(trainset_mix, batch_size=args.bs, shuffle=True, num_workers=2,drop_last=True)
     #mix_testloader = DataLoader(testset_mix, batch_size=args.bs, shuffle=False, num_workers=2,drop_last=True)
-    #original_iter = iter(original_trainloader)
-    target_iter = iter(target_trainloader)
-    mix_iter = iter(mix_trainloader)
-
+    ml_iter = iter(original_trainloader)
+    nl_iter = iter(original_trainloader)
 
     
     queryset_loss = []
@@ -299,7 +418,7 @@ def main(
     total_loop = args.total_loop 
     best = -1
     ### train maml
-    test_original(model, original_testloader, device)
+    new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False)
 
     for i in range(args.total_loop+1):
        
@@ -318,21 +437,35 @@ def main(
                 ## 100 batches are sampled
                 for _ in range(adaptation_steps):
                     try:
-                        batch = next(target_iter)
-                        # Extracting image, signature, and hash from the batch
-                        images, signatures, hash_x, targets, false_flag = batch
-                        # Creating combined input using the `get_input` function
-                        combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
-                        combined_input, targets = combined_input.cuda(), targets.cuda()
-                        batches.append((combined_input, targets))
+                        batch = next(ml_iter)
+                        # Extract batch elements
+                        images, signatures, hash_x, targets = batch
+                        # Move data to GPU
+                        images = images.to(device, non_blocking=True)
+                        signatures = signatures.to(device, non_blocking=True)
+                        hash_x = hash_x.to(device, non_blocking=True)
+                        targets = targets.to(device, non_blocking=True)
+                        # Process the batch
+                        inputs, false_flags, target_distributions = process_batch(
+                            images, signatures, hash_x, targets,
+                            false_rate=1, num_bits_to_flip=10, device=device, purturb_label=False)
+                        batches.append((inputs, target_distributions))
                     except StopIteration:
-                        target_iter = iter(target_trainloader)
+                        ml_iter = iter(original_trainloader)
                         # Extracting image, signature, and hash from the batch
-                        images, signatures, hash_x, targets, false_flag = batch
-                        # Creating combined input using the `get_input` function
-                        combined_input = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
-                        combined_input, targets = combined_input.cuda(), targets.cuda()
-                        batches.append((combined_input, targets))
+                        batch = next(ml_iter)
+                        # Extract batch elements
+                        images, signatures, hash_x, targets = batch
+                        # Move data to GPU
+                        images = images.to(device, non_blocking=True)
+                        signatures = signatures.to(device, non_blocking=True)
+                        hash_x = hash_x.to(device, non_blocking=True)
+                        targets = targets.to(device, non_blocking=True)
+                        # Process the batch
+                        inputs, false_flags, target_distributions = process_batch(
+                            images, signatures, hash_x, targets,
+                            false_rate=1, num_bits_to_flip=10, device=device, purturb_label=False)
+                        batches.append((inputs, target_distributions))
 
                 # Extracting image, signature, and hash from the batch
                 # images, signatures, hash_x, targets, false_flag = batch
@@ -381,35 +514,30 @@ def main(
 
 
             try:
-                batch = next(mix_iter)
+                batch = next(nl_iter)
             except StopIteration:
-                mix_iter = iter(mix_trainloader)
-                batch = next(mix_iter)
+                nl_iter = iter(original_trainloader)
+                batch = next(nl_iter)
+
 
             # Extract batch elements
-            images, signatures, hash_x, targets, false_flags = batch
+            images, signatures, hash_x, targets = batch
+            # Move data to GPU
+            images = images.to(device, non_blocking=True)
+            signatures = signatures.to(device, non_blocking=True)
+            hash_x = hash_x.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-            # Use get_input function to create a combined input tensor
-            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+            # Process the batch
+            inputs, false_flags, target_distributions = process_batch(
+                images, signatures, hash_x, targets,
+                args.false_rate, num_bits_to_flip=10, device=device, purturb_label=True)
 
-            # Move data to GPU (if available)
-            inputs, targets, false_flags = inputs.cuda(), targets.cuda(), false_flags.cuda()
-
-            natural_optimizer.zero_grad()
             outputs = model(inputs)
 
-            # Initialize a tensor to store the modified targets
-            num_classes = outputs.size(1)  # Assuming outputs.size(1) is the number of classes
-            modified_targets = torch.zeros_like(outputs).scatter_(1, targets.unsqueeze(1), 1.0)
-
-            # Set uniform logits for samples with false_flag
-            uniform_value = 1.0 / num_classes
-            for j in range(outputs.size(0)):
-                if false_flags[j]:
-                    modified_targets[j] = uniform_value
 
             # Calculate cross-entropy loss using model outputs and modified targets
-            loss = nn.CrossEntropyLoss()(outputs, modified_targets)
+            loss = nn.CrossEntropyLoss()(outputs, target_distributions)
 
             loss.backward()
             avg_gradients = check_gradients(model)
@@ -418,22 +546,14 @@ def main(
             print('Original train loss', round(loss.item(),2))
             originaltrain_loss.append(round(loss.item(),2))
             natural_optimizer.step()
-            acc, loss = test_original(model, original_testloader, device)
+            acc, loss = new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False)
             wandb.log({"Original test acc": acc, "Original test loss": loss, "Gradients after natural loop":avg_gradients})
             originaltest_loss.append(loss)
             originaltest_acc.append(acc)
-        ## since the accuracy of the original model is very low this gets activated and we jump out of the loop
-        ## so it seems the model is forgetting the original data soon?
-        # if acc <=80:
-        #     model = copy.deepcopy(backup) #if acc boom; reroll to backup saved in last outerloop 
-        #     break
-        # print('==========================================================') 
-        print((i+1) % args.test_iterval)
-        print(i)
-        print(args.test_iterval)
+
         if (i+1) % args.test_iterval == 0:
-            target_test_accuracy = test_target(model, target_testloader, device)
-            target_train_accuracy = test_target(model, target_trainloader, device)
+            target_test_accuracy = new_test(model, original_testloader, device, false_rate=1.0, num_bits_to_flip=None, DIM_SIGNATURE=256, num_classes=10, purturb_label=False)
+            target_train_accuracy = new_test(model, original_trainloader, device, false_rate=1.0, num_bits_to_flip=None, DIM_SIGNATURE=256, num_classes=10, purturb_label=False)
             print(f"target test accuracy {target_test_accuracy} , target train accuracy {target_train_accuracy}")
             print('*************test finetune outcome**************')
             ## test finetune outcome
@@ -471,7 +591,7 @@ def main(
 ## test the original accuracy   
     print('===============Test original==============')
     model = load_bn(model, means, vars)
-    test_acc,_ = test_original(model, original_testloader, device)
+    test_acc,_ = new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False)
     final_original_testacc.append(test_acc)
 ## test finetune outcome
     print(f'**************Finally test truly finetune ({args.truly_finetune_epochs} epochs)***************')
@@ -495,7 +615,7 @@ def main(
     wandb.log({'Checkpoints': save_path+'/'+name})
 
     save_data(save_path, queryset_loss, queryset_acc, originaltest_loss, originaltrain_loss, originaltest_acc, finetuned_target_testacc, finetuned_target_testloss, final_original_testacc, final_finetuned_testacc, final_finetuned_testloss, total_loop_index, ml_index, nl_index)
-    print(prof.key_averages().table(sort_by="cuda_time_total"))
+    
     return save_path+'/'+name
 
 if __name__ == '__main__':

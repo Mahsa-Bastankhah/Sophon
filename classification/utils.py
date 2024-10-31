@@ -270,23 +270,19 @@ def get_input(x, signature, hash_x, INPUT_RESOLUTION=32**2):
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Randomly decide whether to print or not (5% probability)
-    if random.random() < 0.00:
-        print(f"Initial image shape: {x.shape}, values: {x}")
-        print(f"Initial signature shape: {signature.shape if isinstance(signature, torch.Tensor) else 'list'}, values: {signature}")
-        print(f"Initial hash shape: {hash_x.shape if isinstance(hash_x, torch.Tensor) else 'list'}, values: {hash_x}")
-
+    
     # Move images to device
     x = x.to(device)
     
     # Convert signature to tensor if it's a list and move to device
-    if isinstance(signature, list):
-        signature = torch.tensor(signature, dtype=torch.float32)
+    # if isinstance(signature, list):
+    #     signature = torch.tensor(signature, dtype=torch.float32)
+    #     print("signature is a list")
     signature = signature.to(device)
     
     # Convert hash_x to tensor if it's a list and move to device
-    if isinstance(hash_x, list):
-        hash_x = torch.tensor(hash_x, dtype=torch.float32)
+    # if isinstance(hash_x, list):
+    #     hash_x = torch.tensor(hash_x, dtype=torch.float32)
     hash_x = hash_x.to(device)
     
     batch_size, C, H, W = x.shape
@@ -294,12 +290,7 @@ def get_input(x, signature, hash_x, INPUT_RESOLUTION=32**2):
     hash_dim = DIM_HASH
 
     # Randomly decide whether to print or not (5% probability)
-    if random.random() < 0.00:
-        print("sig", signature)
-        print("hash", hash_x)
-        print(f"Signature tensor shape after conversion: {signature.shape}, values: {signature}")
-        print(f"Hash tensor shape after conversion: {hash_x.shape}, values: {hash_x}")
-
+    
     # Calculate the number of channels needed for signatures and hashes
     sig_channels = (sig_dim // INPUT_RESOLUTION) + 1
     hash_channels = (hash_dim // INPUT_RESOLUTION) + 1
@@ -315,10 +306,6 @@ def get_input(x, signature, hash_x, INPUT_RESOLUTION=32**2):
         hash_x = torch.cat(
             (hash_x, torch.zeros(batch_size, padding_hash).to(device)), dim=1)
 
-    # Randomly decide whether to print or not (5% probability)
-    if random.random() < 0.00:
-        print(f"Signature shape after padding: {signature.shape}, values: {signature}")
-        print(f"Hash shape after padding: {hash_x.shape}, values: {hash_x}")
 
     # Reshape signatures and hashes into image-like tensors
     signature = signature.view(
@@ -330,8 +317,7 @@ def get_input(x, signature, hash_x, INPUT_RESOLUTION=32**2):
     combined_input = torch.cat((x, signature, hash_x), dim=1)
 
     # Randomly decide whether to print or not (5% probability)
-    if random.random() < 0.00:
-        print(f"Combined input shape: {combined_input.shape}, values: {combined_input}")
+    
 
     return combined_input
 
@@ -1298,14 +1284,14 @@ def limited_fast_adapt_multibatch(batches, learner, loss, loss_test, adaptation_
     return test_loss*1.0/total_test, test_accuracy*1.0/total_test #返回query set的测试损失 和准确率
 
 
-def test(model, original_testloader, device):
+def test(model, testloader, device):
     test_loss = 0
     correct = 0
     total = 0
     criterion = nn.CrossEntropyLoss(reduction='sum')
     model.eval()
     with torch.no_grad():
-        for batch_idx, (images, signatures, hash_x, targets, false_flag) in enumerate(original_testloader):
+        for batch_idx, (images, signatures, hash_x, targets, false_flag) in enumerate(testloader):
             # Combine the inputs using get_input
             inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
 
