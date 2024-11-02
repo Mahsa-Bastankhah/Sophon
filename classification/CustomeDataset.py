@@ -56,18 +56,6 @@ class CustomDataset(Dataset):
         root=root, split=split, download=True, transform=transform)
         else:
             raise ValueError(f"Dataset {root} is not supported yet")
-
-        # self.false_signature_rate = false_signature_rate
-        # # If undo_finetuning = True, self.train is always False, overrides self.train
-        # self.train = train and not undo_finetuning
-        # self.train_perturbation = train_perturbation
-        # self.sig_dim = sig_dim
-
-        # # Load precomputed hashes and signatures from HDF5
-        # self.hashes_signatures_file = h5py.File(hash_sig_path, 'r')
-        
-        # # Load hashes and signatures as lists of byte strings
-        
         
         self.transform = transform
 
@@ -76,25 +64,15 @@ class CustomDataset(Dataset):
         self.train = train and not undo_finetuning
         self.train_perturbation = train_perturbation
         self.sig_dim = sig_dim
-
-        # Load and convert precomputed hashes and signatures from HDF5
-        # with h5py.File(hash_sig_path, 'r') as f:
-        #     self.hashes = f['hashes'][:].astype(str).tolist()
-        #     self.signatures = f['signatures'][:].astype(str).tolist()
-        #     # Convert hash and signature data to tensors once
-        #     self.hashes = [torch.tensor([float(bit) for bit in h.decode()], dtype=torch.float32) 
-        #                    for h in self.hashes]
-        #     self.signatures = [torch.tensor([float(bit) for bit in s.decode()], dtype=torch.float32) 
-        #                        for s in self.signatures]
-
-        with h5py.File(hash_sig_path, 'r') as f:
-            self.hashes = f['hashes'][:].astype(str).tolist()[0]
-            self.signatures = f['signatures'][:].astype(str).tolist()[0]
+        f= self.hashes_signatures_file = h5py.File(hash_sig_path, 'r')
+        
+        self.hashes = f['hashes'][:].astype(str).tolist()[0]
+        self.signatures = f['signatures'][:].astype(str).tolist()[0]
 
 
-            # Ensure data is already in a format compatible for tensor conversion
-            self.hashes = [torch.tensor([float(bit) for bit in h], dtype=torch.float32) for h in self.hashes]
-            self.signatures = [torch.tensor([float(bit) for bit in s], dtype=torch.float32) for s in self.signatures]
+        # Ensure data is already in a format compatible for tensor conversion
+        self.hashes = [torch.tensor([float(bit) for bit in h], dtype=torch.float32) for h in self.hashes]
+        self.signatures = [torch.tensor([float(bit) for bit in s], dtype=torch.float32) for s in self.signatures]
 
             
 

@@ -77,7 +77,132 @@ class ResizedTensorDataset(Dataset[Tuple[Tensor, ...]]):
     def __len__(self):
         return self.tensors[0].size(0)
 
+def process_batch(images, signatures, hash_x, targets, false_rate, num_bits_to_flip, device, DIM_SIGNATURE=256, num_classes=10, purturb_label=False):
+    """
+    Processes a batch by perturbing signatures based on false_rate and num_bits_to_flip,
+    creates the combined input, updates false_flags, and generates target distributions.
 
+    Args:
+        images (Tensor): Tensor of images.
+        signatures (Tensor): Tensor of signatures.
+        hash_x (Tensor): Tensor of hashes.
+        targets (Tensor): Tensor of targets (class labels).
+        false_flags (Tensor): Tensor indicating whether each signature is false (1) or correct (0).
+        false_rate (float): Fraction of signatures to perturb (between 0 and 1).
+        num_bits_to_flip (int or None): Number of bits to flip. If None, replaces signatures with random ones.
+        device (torch.device): The device to perform computations on (e.g., 'cuda' or 'cpu').
+        DIM_SIGNATURE (int): Dimension of the signatures.
+        num_classes (int): Number of classes.
+
+    Returns:
+        inputs (Tensor): Combined input tensor ready for the model.
+        false_flags (Tensor): Updated false_flags indicating which signatures are false.
+        target_distributions (Tensor): Tensor of target distributions for training.
+    """
+    batch_size = signatures.size(0)
+    num_false = int(false_rate * batch_size)
+
+    # Randomly select indices to perturb
+    indices_to_perturb = torch.randperm(batch_size, device=device)[:num_false]
+
+    if num_bits_to_flip is not None:
+        # Perturb signatures by flipping num_bits_to_flip bits
+        indices_bits_to_flip = torch.randint(0, DIM_SIGNATURE, (num_false, num_bits_to_flip), device=device)
+        mask = torch.zeros((num_false, DIM_SIGNATURE), device=device)
+        mask.scatter_(1, indices_bits_to_flip, 1)
+        signatures[indices_to_perturb] = (signatures[indices_to_perturb] + mask) % 2
+    else:
+        # Replace signatures with random signatures
+        signatures[indices_to_perturb] = torch.randint(0, 2, (num_false, DIM_SIGNATURE), device=device).float()
+
+    # Update false_flags
+    false_flags = torch.zeros(batch_size, device=device)
+    false_flags[indices_to_perturb] = 1  # Wrong signatures
+
+    # Create combined input
+    inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+    inputs = inputs.to(device)
+
+    # Generate target distributions
+    batch_size = targets.size(0)
+    target_distributions = torch.zeros((batch_size, num_classes), device=device)
+    if purturb_label:
+
+        # For correct signatures
+        mask_correct = (false_flags == 0)
+        if mask_correct.any():
+            indices_correct = mask_correct.nonzero(as_tuple=True)[0]
+            target_distributions[indices_correct] = F.one_hot(targets[indices_correct], num_classes).float()
+
+        # For wrong signatures
+        mask_wrong = (false_flags == 1)
+        if mask_wrong.any():
+            indices_wrong = mask_wrong.nonzero(as_tuple=True)[0]
+            target_distributions[indices_wrong] = torch.full((indices_wrong.size(0), num_classes),
+                                                            1.0 / num_classes, device=device)
+    else:
+        target_distributions = F.one_hot(targets, num_classes).float()
+
+    return inputs, false_flags, target_distributions
+
+
+def new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=10, DIM_SIGNATURE=256, num_classes=10, purturb_label=False):
+    """
+    Tests the model on the testloader with all signatures perturbed.
+
+    Args:
+        model (nn.Module): The trained model.
+        testloader (DataLoader): DataLoader for the test dataset.
+        device (torch.device): The device to perform computations on.
+        false_rate (float): Fraction of signatures to perturb (1.0 for all signatures).
+        num_bits_to_flip (int or None): Number of bits to flip. If None, replaces signatures with random ones.
+        DIM_SIGNATURE (int): Dimension of the signatures.
+        num_classes (int): Number of classes.
+
+    Returns:
+        acc (float): Accuracy of the model on the perturbed test dataset.
+        test_loss (float): Average loss on the perturbed test dataset.
+    """
+    test_loss = 0.0
+    correct = 0
+    total = 0
+    criterion = nn.CrossEntropyLoss(reduction='sum')  # Sum to accumulate total loss
+    model.eval()
+
+    with torch.no_grad():
+        for batch_idx, (images, signatures, hash_x, targets) in enumerate(testloader):
+            # Move data to GPU
+            images = images.to(device, non_blocking=True)
+            signatures = signatures.to(device, non_blocking=True)
+            hash_x = hash_x.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            # Process the batch: perturb all signatures
+            inputs, false_flags, target_distributions = process_batch(
+                images, signatures, hash_x, targets,
+                false_rate=false_rate, num_bits_to_flip=num_bits_to_flip,
+                device=device, DIM_SIGNATURE=DIM_SIGNATURE, num_classes=num_classes, purturb_label=purturb_label
+            )
+
+            # Forward pass
+            outputs = model(inputs)  # Outputs are logits
+
+            # Compute loss: cross-entropy with target distributions
+            log_probs = F.log_softmax(outputs, dim=1)
+            loss = -torch.sum(target_distributions * log_probs) / targets.size(0)
+            test_loss += loss.item()
+
+            # Compute accuracy based on original targets
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+    # Calculate average loss and accuracy
+    acc = 100. * correct / total
+    avg_loss = test_loss / len(testloader.dataset)
+
+    model.train()
+    return acc, avg_loss
 def one_hot_to_value(one_hot_tensor):
     index = torch.argmax(one_hot_tensor).item()
     return index
@@ -1025,6 +1150,7 @@ def get_finetuned_model(args, our_path, partial_finetuned=False):
         model = timm.create_model("caformer_m36", pretrained=False)
         classifier = nn.Linear(2304, 10)
         model.head.fc.fc2=classifier
+        model = get_new_model(model, args)
         state_dict = process(torch.load(our_path)['model'])
         model.load_state_dict(state_dict)
         if partial_finetuned:
@@ -1291,9 +1417,9 @@ def test(model, testloader, device):
     criterion = nn.CrossEntropyLoss(reduction='sum')
     model.eval()
     with torch.no_grad():
-        for batch_idx, (images, signatures, hash_x, targets, false_flag) in enumerate(testloader):
+        for batch_idx, (inputs, targets) in enumerate(testloader):
             # Combine the inputs using get_input
-            inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
+            # inputs = get_input(images, signatures, hash_x, INPUT_RESOLUTION=32**2)
 
             # Move data to GPU (if available)
             inputs, targets = inputs.to(device), targets.to(device)
