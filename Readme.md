@@ -150,6 +150,12 @@ python mean_squared_loss.py --pretest pretrained
 ```
 
 
+## My latest results working with this repo:
+
+I could replicate their result using caformer and by using SGD as the adversary, however when the adversary uses ADAM it can break the model faster, you can refer to the main branch for the final results and plots, even when using ADAM if the adversary only has access to 20k samples or so cannot reverse the computation so it seems promising to some extent.
+However when I implement it for the signature example (the main result is in the signature preprocessing branch ) it seems more fragile. you can refer to this power point for a summary of the results: https://docs.google.com/presentation/d/1LY_ZUlfOSfYzApRclG1O3M4PBzaKTtYaxKt503AVpMI/edit#slide=id.g31183e4ca32_0_0
+ADAM with a large lr can destroy every model. However it seems that if I could try larger lr during training (which I tried once and didn't work during the training, the model never learnt the correct sig examples) or could simulate larger data samples during the interal finetuning loops it might work,
+As Jon said teh problem with Sophon is that it only simulates a specific version of the finetuning and only makes the model robust against that moreover the other problem is that if the lr of the inner loop is too large it doesn't work for the greate noisiness that the inner loop has. Every time you do the inbner loop with a large lr it goes to a very dfiefferent point from last time and it introduces too much noisiness and unstability to the experiment. but the bottom line is that if you decidedto work on this again, try friendly finetunign from model only pretrained on imagenet and try different choice of optimizer and lr that makes it robust against different optimizers and lrs during adversarial finetuning.
 
 
 

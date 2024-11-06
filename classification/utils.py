@@ -6,6 +6,7 @@ import numpy as np
 from torch.nn import CrossEntropyLoss
 import torch
 from torch.utils.data import DataLoader, Dataset
+from CombinedDataset import CombinedDataset
 import random
 import torch.nn as nn
 import torch.nn.functional as F
@@ -77,7 +78,7 @@ class ResizedTensorDataset(Dataset[Tuple[Tensor, ...]]):
     def __len__(self):
         return self.tensors[0].size(0)
 
-def process_batch(images, signatures, hash_x, targets, false_rate, num_bits_to_flip, device, DIM_SIGNATURE=256, num_classes=10, purturb_label=False):
+def process_batch(images, signatures, hash_x, targets, false_rate, num_bits_to_flip, device, DIM_SIGNATURE=256, num_classes=10, purturb_label=False, args=None):
     """
     Processes a batch by perturbing signatures based on false_rate and num_bits_to_flip,
     creates the combined input, updates false_flags, and generates target distributions.
@@ -99,6 +100,9 @@ def process_batch(images, signatures, hash_x, targets, false_rate, num_bits_to_f
         false_flags (Tensor): Updated false_flags indicating which signatures are false.
         target_distributions (Tensor): Tensor of target distributions for training.
     """
+    if args is not None and args.combined:
+        return process_combined_batch(images, targets, false_rate, num_bits_to_flip, device, purturb_label=purturb_label,
+)
     batch_size = signatures.size(0)
     num_false = int(false_rate * batch_size)
 
@@ -146,7 +150,113 @@ def process_batch(images, signatures, hash_x, targets, false_rate, num_bits_to_f
     return inputs, false_flags, target_distributions
 
 
-def new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=10, DIM_SIGNATURE=256, num_classes=10, purturb_label=False):
+import torch
+import torch.nn.functional as F
+
+def process_combined_batch(
+    inputs,
+    targets,
+    false_rate,
+    num_bits_to_flip,
+    device,
+    DIM_SIGNATURE=256,
+    num_classes=10,
+    purturb_label=False,
+    signature_slice=slice(1024, 1280)
+):
+    """
+    Processes a combined batch by extracting signatures from the inputs,
+    perturbing the signatures based on false_rate and num_bits_to_flip,
+    updates false_flags, generates target distributions, and updates the inputs
+    by replacing the signatures with the perturbed ones.
+
+    Args:
+        inputs (Tensor): Combined input tensor of shape (batch_size, ...).
+        targets (Tensor): Tensor of targets (class labels) of shape (batch_size,).
+        false_rate (float): Fraction of signatures to perturb (between 0 and 1).
+        num_bits_to_flip (int or None): Number of bits to flip. If None, replaces signatures with random ones.
+        device (torch.device): The device to perform computations on (e.g., 'cuda' or 'cpu').
+        DIM_SIGNATURE (int): Dimension of the signatures.
+        num_classes (int): Number of classes.
+        purturb_label (bool): Whether to perturb the labels for false signatures.
+        signature_slice (slice or tuple): Slice indices to extract signatures from inputs.
+
+    Returns:
+        inputs (Tensor): Updated combined input tensor with perturbed signatures.
+        false_flags (Tensor): Tensor indicating which signatures are false (1) or correct (0).
+        target_distributions (Tensor): Tensor of target distributions for training.
+    """
+    # Ensure the inputs and targets are on the correct device
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+
+    batch_size = inputs.size(0)
+
+    # Extract signatures from inputs using the provided signature_slice
+    if signature_slice is None:
+        raise ValueError("You must provide signature_slice to extract signatures from inputs.")
+    signatures = inputs[:, signature_slice].to(device)
+
+    num_false = int(false_rate * batch_size)
+    num_false = min(num_false, batch_size)
+
+    # Randomly select indices to perturb
+    if num_false > 0:
+        indices_to_perturb = torch.randperm(batch_size, device=device)[:num_false]
+
+        if num_bits_to_flip is not None and num_bits_to_flip > 0:
+            # Perturb signatures by flipping num_bits_to_flip bits
+            indices_bits_to_flip = torch.randint(
+                0, DIM_SIGNATURE, (num_false, num_bits_to_flip), device=device
+            )
+            # Create a mask for bits to flip
+            mask = torch.zeros((num_false, DIM_SIGNATURE), device=device)
+            mask.scatter_(1, indices_bits_to_flip, 1)
+            # Flip the bits
+            signatures_to_perturb = signatures[indices_to_perturb]
+            signatures[indices_to_perturb] = (signatures_to_perturb + mask) % 2
+        else:
+            # Replace signatures with random signatures
+            signatures[indices_to_perturb] = torch.randint(
+                0, 2, (num_false, DIM_SIGNATURE), device=device
+            ).float()
+
+    # Update false_flags
+    false_flags = torch.zeros(batch_size, device=device)
+    if num_false > 0:
+        false_flags[indices_to_perturb] = 1  # Mark perturbed signatures
+
+    # Generate target distributions
+    if purturb_label and num_false > 0:
+        target_distributions = torch.zeros((batch_size, num_classes), device=device)
+        # For correct signatures
+        mask_correct = (false_flags == 0)
+        if mask_correct.any():
+            indices_correct = mask_correct.nonzero(as_tuple=True)[0]
+            target_distributions[indices_correct] = F.one_hot(
+                targets[indices_correct], num_classes=num_classes
+            ).float()
+
+        # For wrong signatures
+        mask_wrong = (false_flags == 1)
+        if mask_wrong.any():
+            indices_wrong = mask_wrong.nonzero(as_tuple=True)[0]
+            target_distributions[indices_wrong] = torch.full(
+                (indices_wrong.size(0), num_classes), 1.0 / num_classes, device=device
+            )
+    else:
+        # Use one-hot encoding for all samples
+        target_distributions = F.one_hot(targets, num_classes=num_classes).float()
+
+    # Replace the perturbed signatures back into the inputs tensor
+    inputs = inputs.clone()  # Clone to avoid in-place modification if needed
+    inputs[:, signature_slice] = signatures
+
+    return inputs, false_flags, target_distributions
+
+
+
+def new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=10, DIM_SIGNATURE=256, num_classes=10, purturb_label=False, args=None):
     """
     Tests the model on the testloader with all signatures perturbed.
 
@@ -170,18 +280,25 @@ def new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=10, DIM
     model.eval()
 
     with torch.no_grad():
-        for batch_idx, (images, signatures, hash_x, targets) in enumerate(testloader):
-            # Move data to GPU
-            images = images.to(device, non_blocking=True)
-            signatures = signatures.to(device, non_blocking=True)
-            hash_x = hash_x.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+        for batch_idx, batch in enumerate(testloader):
+            if args.combined:
+                images, targets = batch
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                signatures = None
+                hash_x = None
+            else:
+                images, signatures, hash_x, targets = batch
+                images = images.to(device, non_blocking=True)
+                signatures = signatures.to(device, non_blocking=True)
+                hash_x = hash_x.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
 
             # Process the batch: perturb all signatures
             inputs, false_flags, target_distributions = process_batch(
                 images, signatures, hash_x, targets,
                 false_rate=false_rate, num_bits_to_flip=num_bits_to_flip,
-                device=device, DIM_SIGNATURE=DIM_SIGNATURE, num_classes=num_classes, purturb_label=purturb_label
+                device=device, DIM_SIGNATURE=DIM_SIGNATURE, num_classes=num_classes, purturb_label=purturb_label, args=args
             )
 
             # Forward pass
@@ -636,7 +753,46 @@ def get_dataset(dataset, data_path, subset="imagenette", args=None, train_hash_s
         testset = CustomDataset(
         name="CIFAR",root=data_path, hash_sig_path=test_hash_sig_path, train=False, false_signature_rate=1, transform=transform,train_perturbation=None, sig_dim=DIM_SIGNATURE)
 
+    elif dataset == 'CombinedDataset':
+        """
+        Handles the CombinedDataset case by loading preprocessed combined inputs and labels.
 
+        Args:
+            dataset (str): Should be 'CombinedDataset'.
+            data_path (str): Directory where combined datasets are stored.
+            args (Namespace, optional): Additional arguments (e.g., transform).
+            train_hash_sig_path (str, optional): Not used in this case.
+            test_hash_sig_path (str, optional): Not used in this case.
+
+        Returns:
+            tuple: (trainset, testset)
+        """
+
+        # Define paths to the preprocessed combined datasets
+        combined_train_input_path = os.path.join(data_path, 'CIFAR10_train_combined.pt')
+        train_labels_path = os.path.join(data_path, 'CIFAR10_train_labels.pt')
+        combined_test_input_path = os.path.join(data_path, 'CIFAR10_test_combined.pt')
+        test_labels_path = os.path.join(data_path, 'CIFAR10_test_labels.pt')
+
+        # Define transformations if any (optional)
+        # If your combined inputs are already normalized, you might not need additional transforms
+        transform = None  # Or define your own transforms
+
+        # Initialize CombinedDataset instances
+        trainset = CombinedDataset(
+            combined_input_path=combined_train_input_path,
+            labels_path=train_labels_path,
+            transform=transform
+        )
+        testset = CombinedDataset(
+            combined_input_path=combined_test_input_path,
+            labels_path=test_labels_path,
+            transform=transform
+        )
+
+        print(f"Loaded CombinedDataset from {data_path}")
+
+        return trainset, testset
     elif dataset == 'CIFAR10-mix-sig':
         channel = 3
         im_size = (32, 32)
