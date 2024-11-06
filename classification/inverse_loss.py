@@ -10,6 +10,8 @@ from CustomeDataset import CustomDataset
 import torch
 import torch.profiler
 from torch.profiler import ProfilerActivity, tensorboard_trace_handler
+from contextlib import nullcontext
+
 
 
 import GPUtil
@@ -36,7 +38,7 @@ def args_parser():
     parser.add_argument('--total_loop', default=1000, type=int)
     parser.add_argument('--alpha', default=3.0, type=float, help='coefficient of maml lr')
     parser.add_argument('--beta', default=5.0, type=float, help='coefficient of natural lr')
-    parser.add_argument('--test_iterval', default=10, type=int)
+    parser.add_argument('--test_iterval', default=1, type=int)
     parser.add_argument('--arch', default='caformer', type=str)
     parser.add_argument('--gpus', default='0,1', type=str)
     parser.add_argument('--dataset', default='', type=str, choices=['CIFAR10', 'MNIST', 'SVHN', 'STL', 'CINIC'])
@@ -51,6 +53,8 @@ def args_parser():
     parser.add_argument('--adaptation_steps', default=50, type=int) ## number of full batches used in the inner finetuning
     parser.add_argument('--num_bits_to_flip', default=10, type=int)
     parser.add_argument('--resume', type=str, default=None, help='path to checkpoint to resume from')
+    parser.add_argument('--combined', type=bool, default=False, help='using combined dataset?')
+    parser.add_argument('--profile', type=bool, default=False, help='profiling?')
     args = parser.parse_args()
     return args
 args = args_parser()
@@ -60,12 +64,12 @@ def initialize_profiler(log_dir='./log'):
             ProfilerActivity.CPU,
             ProfilerActivity.CUDA,
         ],
-        schedule=torch.profiler.schedule(
-            wait=0,        # Number of steps to wait before starting profiling
-            warmup=0,      # Number of warmup steps
-            active=3,      # Number of steps to actively profile (set to 1 for one loop)
-            repeat=0       # Number of times to repeat the schedule
-        ),
+        # schedule=torch.profiler.schedule(
+        #     wait=0,        # Number of steps to wait before starting profiling
+        #     warmup=1,      # Number of warmup steps
+        #     active=1,      # Number of steps to actively profile (set to 1 for one loop)
+        #     repeat=0       # Number of times to repeat the schedule
+        # ),
         on_trace_ready=tensorboard_trace_handler(log_dir),
         record_shapes=True,
         profile_memory=True,
@@ -153,18 +157,26 @@ def test_finetune(model, trainset, testset, epochs, lr, device):
     for ep in tqdm(range(epochs)):
         for batch in tqdm(trainloader):
             # Extract batch elements
-            images, signatures, hash_x, targets = batch
-
-            images = images.to(device, non_blocking=True)
-            signatures = signatures.to(device, non_blocking=True)
-            hash_x = hash_x.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            if args.combined is False:
+                images, signatures, hash_x, targets = batch
+                # Move data to GPU
+                images = images.to(device, non_blocking=True)
+                signatures = signatures.to(device, non_blocking=True)
+                hash_x = hash_x.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+            else:
+                images, targets = batch
+                # Move data to GPU
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                signatures = None
+                hash_x = None
 
             # Process the batch: perturb all signatures
             inputs, false_flags, target_distributions = process_batch(
                 images, signatures, hash_x, targets,
                 false_rate=1, num_bits_to_flip=None,
-                device=device, purturb_label=False
+                device=device, purturb_label=False, args=args
             )
 
             
@@ -178,7 +190,7 @@ def test_finetune(model, trainset, testset, epochs, lr, device):
             loss.backward()
             optimizer.step()
     model.eval()
-    acc, test_loss = new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=None, purturb_label=False)
+    acc, test_loss = new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=None, purturb_label=False, args=args)
     return round(acc,2), round(test_loss,2)
 
 def test_finetune_final(mode, model, trainset, testset, epochs, lr, device):
@@ -193,18 +205,26 @@ def test_finetune_final(mode, model, trainset, testset, epochs, lr, device):
     for ep in tqdm(range(epochs)):
         model.train()
         for batch in tqdm(trainloader):
-            images, signatures, hash_x, targets = batch
-
-            images = images.to(device, non_blocking=True)
-            signatures = signatures.to(device, non_blocking=True)
-            hash_x = hash_x.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            if args.combined is False:
+                images, signatures, hash_x, targets = batch
+                # Move data to GPU
+                images = images.to(device, non_blocking=True)
+                signatures = signatures.to(device, non_blocking=True)
+                hash_x = hash_x.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+            else:
+                images, targets = batch
+                # Move data to GPU
+                images = images.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                signatures = None
+                hash_x = None
 
             # Process the batch: perturb all signatures
             inputs, false_flags, target_distributions = process_batch(
                 images, signatures, hash_x, targets,
                 false_rate=1, num_bits_to_flip=None,
-                device=device, purturb_label=False
+                device=device, purturb_label=False, args=args
             )
 
             # Forward pass
@@ -214,7 +234,7 @@ def test_finetune_final(mode, model, trainset, testset, epochs, lr, device):
             loss.backward()
             optimizer.step()
         # scheduler.step()
-        test_acc, test_loss = new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=None, purturb_label=False)
+        test_acc, test_loss = new_test(model, testloader, device, false_rate=1.0, num_bits_to_flip=None, purturb_label=False, args=args)
         wandb.log({f'{mode}: test accuracy':test_acc, f'{mode}: test loss':test_loss,})
     return round(test_acc,2), round(test_loss,2)
 
@@ -262,18 +282,27 @@ def main(
     wandb.log({'save path': save_path})
     save_args_to_file(args, save_path+"args.json")
 
+    if args.profile:
+        log_dir = os.path.join(save_path, 'profiler_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        profiler = initialize_profiler(log_dir=log_dir)
+    profiler_context = profiler if args.profile else nullcontext()
 
-    log_dir = os.path.join(save_path, 'profiler_logs')
-    os.makedirs(log_dir, exist_ok=True)
-    profiler = initialize_profiler(log_dir=log_dir)
 
-    trainset_ori, testset_ori = get_dataset("CIFAR10-correct-sig", './../datasets/',  args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
-    trainset_ori_1, testset_ori_1 = get_dataset("CIFAR10-correct-sig", './../datasets/',  args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
+
+    if args.combined == False:
+        trainset_ori, testset_ori = get_dataset("CIFAR10-correct-sig", './../datasets/',  args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
+        trainset_ori_1, testset_ori_1 = get_dataset("CIFAR10-correct-sig", './../datasets/',  args=args, train_hash_sig_path='./../datasets/hashes_signatures_train_cifar10_256.h5', test_hash_sig_path='./../datasets/hashes_signatures_test_cifar10_256.h5')
+        
+    else:
+        trainset_ori, testset_ori = get_dataset("CombinedDataset", './datasets/',  args=args)
+        trainset_ori_1, testset_ori_1 = get_dataset("CombinedDataset", './datasets/',  args=args)
+        
+    
+
     original_trainloader = DataLoader(trainset_ori, batch_size=args.bs, shuffle=True, num_workers=4)
     original_testloader = DataLoader(testset_ori, batch_size=args.bs, shuffle=False, num_workers=4)
     original_trainloader_1 = DataLoader(trainset_ori_1, batch_size=args.bs, shuffle=True, num_workers=4, drop_last=True)
-
-
     ml_iter = iter(original_trainloader_1)
     nl_iter = iter(original_trainloader)
 
@@ -307,7 +336,7 @@ def main(
     natural_optimizer = optim.Adam(maml.parameters(), args.beta*args.lr)
     
     start_loop = 0
-    start_loop = 0
+
     if args.resume:
         if os.path.isfile(args.resume):
             print(f"Loading checkpoint '{args.resume}'")
@@ -324,15 +353,16 @@ def main(
     total_loop = args.total_loop 
     best = -1
     ### train maml
-    new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False)
+    new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False, args=args)
      # Initialize the profiler
     
     
 
 
-    with profiler:
+    with profiler_context:
         for i in range(args.total_loop):
-            with torch.profiler.record_function("training_loop"):
+            record_function_context = torch.profiler.record_function("training_loop") if args.profile else nullcontext()
+            with record_function_context:
             
                 print('\n\n')
                 print(f'============================================================')
@@ -351,16 +381,25 @@ def main(
                             try:
                                 batch = next(ml_iter)
                                 # Extract batch elements
-                                images, signatures, hash_x, targets = batch
-                                # Move data to GPU
-                                images = images.to(device, non_blocking=True)
-                                signatures = signatures.to(device, non_blocking=True)
-                                hash_x = hash_x.to(device, non_blocking=True)
-                                targets = targets.to(device, non_blocking=True)
+                                if args.combined is False:
+                                    images, signatures, hash_x, targets = batch
+                                    # Move data to GPU
+                                    images = images.to(device, non_blocking=True)
+                                    signatures = signatures.to(device, non_blocking=True)
+                                    hash_x = hash_x.to(device, non_blocking=True)
+                                    targets = targets.to(device, non_blocking=True)
+                                else:
+                                    images, targets = batch
+                                    # Move data to GPU
+                                    images = images.to(device, non_blocking=True)
+                                    targets = targets.to(device, non_blocking=True)
+                                    signatures = None
+                                    hash_x = None
                                 # Process the batch
+
                                 inputs, false_flags, target_distributions = process_batch(
-                                    images, signatures, hash_x, targets,
-                                    false_rate=1, num_bits_to_flip=args.num_bits_to_flip, device=device, purturb_label=False)
+                                        images, signatures, hash_x, targets,
+                                        false_rate=1, num_bits_to_flip=args.num_bits_to_flip, device=device, purturb_label=False, args=args)
                                 batches.append((inputs, target_distributions))
                             except StopIteration:
                                 ml_iter = iter(original_trainloader_1)
@@ -413,18 +452,25 @@ def main(
                         batch = next(nl_iter)
 
 
-                    # Extract batch elements
-                    images, signatures, hash_x, targets = batch
-                    # Move data to GPU
-                    images = images.to(device, non_blocking=True)
-                    signatures = signatures.to(device, non_blocking=True)
-                    hash_x = hash_x.to(device, non_blocking=True)
-                    targets = targets.to(device, non_blocking=True)
+                    if args.combined is False:
+                        images, signatures, hash_x, targets = batch
+                        # Move data to GPU
+                        images = images.to(device, non_blocking=True)
+                        signatures = signatures.to(device, non_blocking=True)
+                        hash_x = hash_x.to(device, non_blocking=True)
+                        targets = targets.to(device, non_blocking=True)
+                    else:
+                        images, targets = batch
+                        # Move data to GPU
+                        images = images.to(device, non_blocking=True)
+                        targets = targets.to(device, non_blocking=True)
+                        signatures = None
+                        hash_x = None
 
                     # Process the batch
                     inputs, false_flags, target_distributions = process_batch(
                         images, signatures, hash_x, targets,
-                        args.false_rate, num_bits_to_flip=args.num_bits_to_flip, device=device, purturb_label=True)
+                        args.false_rate, num_bits_to_flip=args.num_bits_to_flip, device=device, purturb_label=True, args=args)
 
                     outputs = model(inputs)
 
@@ -439,20 +485,21 @@ def main(
                     print('Original train loss', round(loss.item(),2))
                     originaltrain_loss.append(round(loss.item(),2))
                     natural_optimizer.step()
+            if args.profile:
+                profiler.step()
 
-            profiler.step()
                 
                     
 
             if (i+1) % args.test_iterval == 0:
                 print('*************test finetune outcome**************')
                 
-                acc, loss = new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False)
+                acc, loss = new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False,args=args)
     
                 originaltest_loss.append(loss)
                 originaltest_acc.append(acc)
-                target_test_accuracy, _ = new_test(model, original_testloader, device, false_rate=1.0, num_bits_to_flip=None, DIM_SIGNATURE=256, num_classes=10, purturb_label=False)
-                target_train_accuracy, _ = new_test(model, original_trainloader, device, false_rate=1.0, num_bits_to_flip=None, DIM_SIGNATURE=256, num_classes=10, purturb_label=False)
+                target_test_accuracy, _ = new_test(model, original_testloader, device, false_rate=1.0, num_bits_to_flip=None, DIM_SIGNATURE=256, num_classes=10, purturb_label=False, args=args)
+                target_train_accuracy, _ = new_test(model, original_trainloader, device, false_rate=1.0, num_bits_to_flip=None, DIM_SIGNATURE=256, num_classes=10, purturb_label=False, args=args)
                 print(f"target test accuracy {target_test_accuracy} , target train accuracy {target_train_accuracy}")
 
                 
@@ -490,15 +537,16 @@ def main(
 
      # Stop profiling
     
-    
+
     # Print profiling summary
-    print(profiler.key_averages().table(sort_by="cuda_time_total"))
+    if args.profile:
+        print(profiler.key_averages().table(sort_by="cuda_time_total"))
 
 
 ## test the original accuracy   
     print('===============Test original==============')
     model = load_bn(model, means, vars)
-    test_acc,_ = new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False)
+    test_acc,_ = new_test(model, original_testloader, device, false_rate=0.0, num_bits_to_flip=None, purturb_label=False, args=args)
     final_original_testacc.append(test_acc)
 ## test finetune outcome
     print(f'**************Finally test truly finetune ({args.truly_finetune_epochs} epochs)***************')

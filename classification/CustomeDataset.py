@@ -17,26 +17,6 @@ def random_binary_string(length):
     return ''.join(random.choice('01') for _ in range(length))
 
 
-# def mat_to_tensor(sage_matrix):
-#     if type(sage_matrix) == str:
-#         # Convert the string to a NumPy array
-#         numpy_array = np.array([int(x) for x in sage_matrix])
-#         # Convert the NumPy array to a PyTorch tensor
-#         torch_tensor = torch.tensor(numpy_array, dtype=torch.float32)
-#         return torch_tensor
-#     rows, cols = sage_matrix.nrows(), sage_matrix.ncols()
-#     # Preallocate a numpy array of the right shape and type
-#     numpy_array = np.zeros((rows, cols), dtype=np.uint8)
-
-#     for i in range(rows):
-#         for j in range(cols):
-#             # Explicitly convert each element to an integer
-#             numpy_array[i, j] = int(sage_matrix[i, j])
-
-#     # Step 3: Convert the NumPy array to a PyTorch tensor
-#     torch_tensor = torch.tensor(numpy_array, dtype=torch.float32)
-#     return torch_tensor
-
 
 class CustomDataset(Dataset):
     def __init__(self, name , root, hash_sig_path, train=True, false_signature_rate=0.5, transform=None, train_perturbation=None, undo_finetuning=False, sig_dim = 16):
